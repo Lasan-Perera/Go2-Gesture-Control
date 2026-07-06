@@ -7,12 +7,23 @@ Standalone, real-time DYNAMIC hand gesture detector.
 No ROS, no simulator - just: webcam -> MediaPipe hand tracking ->
 motion-based gesture classification -> on-screen + console command.
 
-Gestures recognized:
+Gestures recognized (only while ARMED - see below):
     Swipe hand left   -> "TURN LEFT"
     Swipe hand right  -> "TURN RIGHT"
     Push hand forward -> "MOVE FORWARD"
     Pull hand back    -> "MOVE BACKWARD"
     Open palm, held   -> "STOP"
+
+Wake-gesture (arm / disarm) - this is what prevents random/incidental
+hand movement from being treated as a command:
+    - System starts LOCKED (idle). All motion is ignored.
+    - Hold an OPEN palm still, INSIDE the drawn control-zone box,
+      for about a second -> system ARMS. Only now do swipe/push/pull/
+      stop commands get dispatched.
+    - Hold a CLOSED FIST still, inside the zone, for about a second
+      while armed -> system DISARMS back to idle/ignoring everything.
+    - Gestures made outside the control-zone box are always ignored,
+      armed or not.
 
 How it works (high level):
     1. Every frame, MediaPipe gives us 21 hand landmarks.
@@ -50,6 +61,19 @@ STILL_MOTION_THRESH = 0.015 # max movement allowed to count as "held still" (for
 STOP_HOLD_FRAMES = 10       # how many consecutive still+open frames needed to trigger STOP
 DISPLAY_HOLD_SECONDS = 0.9  # how long the detected command stays on screen before resetting
 NO_HAND_RESET_FRAMES = 8    # if hand is lost this many frames, clear the buffer
+
+# --- Control zone (Region of Interest) ---
+# Only hands whose palm center falls inside this box (fractions of frame
+# width/height) are ever considered. Keeps random hands/people at the
+# edges of the frame, or your own hand resting on a desk, from triggering
+# anything.
+ROI_X_MIN, ROI_X_MAX = 0.20, 0.80
+ROI_Y_MIN, ROI_Y_MAX = 0.12, 0.88
+
+# --- Arm / disarm (wake gesture) ---
+ARM_HOLD_FRAMES = 15        # ~0.5-1s of held open palm (inside ROI) to ARM
+DISARM_HOLD_FRAMES = 15     # ~0.5-1s of held closed fist (inside ROI) to DISARM
+ARMED_TIMEOUT_SECONDS = 20  # auto-disarm if no command fires for this long (safety net)
 
 # MediaPipe hand landmark indices we need
 WRIST = 0
@@ -95,10 +119,48 @@ def is_hand_open(landmarks):
     return extended >= 3  # majority of fingers extended counts as "open"
 
 
+def is_hand_closed(landmarks):
+    """Rough check: are all 4 fingers curled (tip below/near pip) -> a fist?"""
+    fingers = [
+        (INDEX_TIP, INDEX_PIP),
+        (MIDDLE_TIP, MIDDLE_PIP),
+        (RING_TIP, RING_PIP),
+        (PINKY_TIP, PINKY_PIP),
+    ]
+    curled = 0
+    for tip, pip in fingers:
+        if landmarks[tip].y > landmarks[pip].y:  # tip lower (larger y) than pip = curled
+            curled += 1
+    return curled >= 3
+
+
+def in_roi(cx, cy):
+    """Is this palm center inside the control-zone box?"""
+    return ROI_X_MIN <= cx <= ROI_X_MAX and ROI_Y_MIN <= cy <= ROI_Y_MAX
+
+
+def _held_still(pts, n_frames, predicate):
+    """True if the last n_frames samples are all within STILL_MOTION_THRESH
+    of the first of those frames' position, AND all satisfy `predicate`
+    (e.g. is_hand_open, is_hand_closed)."""
+    if len(pts) < n_frames:
+        return False
+    window = pts[-n_frames:]
+    x0, y0 = window[0][1], window[0][2]
+    return all(
+        abs(p[1] - x0) < STILL_MOTION_THRESH and
+        abs(p[2] - y0) < STILL_MOTION_THRESH and
+        predicate(p)
+        for p in window
+    )
+
+
 def classify_gesture(buffer):
     """
-    Look at the rolling buffer of (t, cx, cy, size, open) samples and decide
-    if a dynamic gesture just happened. Returns a command string or None.
+    Look at the rolling buffer of (t, cx, cy, size, open, closed, in_roi)
+    samples and decide if a dynamic MOVEMENT gesture just happened.
+    Returns a command string or None. Does NOT include arm/disarm -
+    those are checked separately since they apply in different states.
     """
     if len(buffer) < WINDOW_FRAMES:
         return None
@@ -125,13 +187,7 @@ def classify_gesture(buffer):
         return "MOVE FORWARD" if dsize > 0 else "MOVE BACKWARD"
 
     # --- Stop: hand basically motionless AND open for a sustained number of frames ---
-    still_and_open = all(
-        abs(p[1] - pts[0][1]) < STILL_MOTION_THRESH and
-        abs(p[2] - pts[0][2]) < STILL_MOTION_THRESH and
-        p[4]
-        for p in pts
-    )
-    if still_and_open and len(pts) >= STOP_HOLD_FRAMES:
+    if _held_still(pts, STOP_HOLD_FRAMES, lambda p: p[4]):
         return "STOP"
 
     return None
@@ -153,15 +209,22 @@ def main():
         print("ERROR: could not open webcam (device 0). Check camera permissions/connection.")
         return
 
-    buffer = deque(maxlen=WINDOW_FRAMES)
+    buffer = deque(maxlen=max(WINDOW_FRAMES, ARM_HOLD_FRAMES, DISARM_HOLD_FRAMES))
     no_hand_count = 0
 
     # Display-hold state: when a gesture fires, freeze on it briefly then reset
     display_command = None
     display_until = 0.0
 
+    # armed = False -> idle/locked, ignoring all movement gestures.
+    # armed = True  -> actively listening for swipe/push/pull/stop.
+    armed = False
+    armed_since = 0.0
+
     print("Gesture control running. Press 'q' in the video window to quit.")
-    print("Show: swipe left/right, push toward camera, pull away, or hold an open palm still.\n")
+    print("LOCKED (idle). Hold an OPEN palm still inside the box to ARM.")
+    print("Once armed: swipe left/right, push toward camera, pull away, or hold open palm to STOP.")
+    print("Hold a CLOSED FIST still inside the box to DISARM.\n")
 
     while True:
         ok, frame = cap.read()
@@ -170,11 +233,13 @@ def main():
             break
 
         frame = cv2.flip(frame, 1)  # mirror for natural "selfie" interaction
+        h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
 
         now = time.time()
         detected_this_frame = None
+        hand_in_roi = False
 
         if result.multi_hand_landmarks:
             no_hand_count = 0
@@ -184,27 +249,65 @@ def main():
             cx, cy = palm_center(landmarks)
             size = palm_size(landmarks)
             open_hand = is_hand_open(landmarks)
-            buffer.append((now, cx, cy, size, open_hand))
+            closed_hand = is_hand_closed(landmarks)
+            hand_in_roi = in_roi(cx, cy)
 
-            # Only look for a new gesture if we're not currently freezing on a previous one
+            # Only feed the buffer while the hand is inside the control zone -
+            # this is what stops hands/people outside the box from ever mattering.
+            if hand_in_roi:
+                buffer.append((now, cx, cy, size, open_hand, closed_hand))
+            else:
+                buffer.clear()
+
             if now >= display_until:
-                cmd = classify_gesture(buffer)
-                if cmd is not None:
-                    detected_this_frame = cmd
+                if not armed:
+                    # Idle: the ONLY thing we look for is the arm (wake) gesture.
+                    pts = list(buffer)
+                    if _held_still(pts, ARM_HOLD_FRAMES, lambda p: p[4]):
+                        armed = True
+                        armed_since = now
+                        buffer.clear()
+                        print("[ARMED] Now listening for movement commands.")
+                else:
+                    # Armed: check disarm first, then normal movement gestures.
+                    pts = list(buffer)
+                    if _held_still(pts, DISARM_HOLD_FRAMES, lambda p: p[5]):
+                        armed = False
+                        buffer.clear()
+                        print("[DISARMED] Back to locked/idle.")
+                    else:
+                        cmd = classify_gesture(buffer)
+                        if cmd is not None:
+                            detected_this_frame = cmd
         else:
             no_hand_count += 1
             if no_hand_count >= NO_HAND_RESET_FRAMES:
                 buffer.clear()
 
+        # Safety net: auto-disarm if armed but nothing happened for a while
+        if armed and (now - armed_since) > ARMED_TIMEOUT_SECONDS and now >= display_until:
+            armed = False
+            buffer.clear()
+            print("[DISARMED] Timed out with no commands.")
+
         # If a new gesture was just recognized, lock it in for display + reset the buffer
         if detected_this_frame is not None:
             display_command = detected_this_frame
             display_until = now + DISPLAY_HOLD_SECONDS
+            armed_since = now  # reset the "still armed and active" timer
             buffer.clear()  # instantly ready to start collecting the NEXT gesture
             print(f"[GESTURE DETECTED] -> {display_command}")
 
-        # --- On-screen overlay ---
-        h, w = frame.shape[:2]
+        # --- Draw the control-zone box ---
+        roi_color = (0, 200, 0) if armed else (0, 165, 255)
+        cv2.rectangle(
+            frame,
+            (int(ROI_X_MIN * w), int(ROI_Y_MIN * h)),
+            (int(ROI_X_MAX * w), int(ROI_Y_MAX * h)),
+            roi_color, 2,
+        )
+
+        # --- On-screen status overlay ---
         if now < display_until and display_command is not None:
             # Big, obvious command banner while "frozen" on the detected gesture
             cv2.rectangle(frame, (0, 0), (w, 70), (0, 130, 0), -1)
@@ -212,8 +315,16 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3)
         else:
             display_command = None
-            cv2.rectangle(frame, (0, 0), (w, 40), (60, 60, 60), -1)
-            status = "watching..." if result.multi_hand_landmarks else "show your hand"
+            bar_color = (0, 110, 0) if armed else (60, 60, 60)
+            cv2.rectangle(frame, (0, 0), (w, 40), bar_color, -1)
+            if armed:
+                status = "ARMED - listening for commands"
+            elif result.multi_hand_landmarks and not hand_in_roi:
+                status = "hand outside control zone"
+            elif result.multi_hand_landmarks:
+                status = "hold OPEN PALM still to ARM"
+            else:
+                status = "LOCKED - show hand in box to arm"
             cv2.putText(frame, status, (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
