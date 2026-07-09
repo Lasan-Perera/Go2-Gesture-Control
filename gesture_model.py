@@ -11,18 +11,12 @@ import os
 
 import numpy as np
 
+from config import MODEL_PATH, CONFIDENCE_THRESHOLD, WINDOW_FRAMES
 from gesture_common import (
-    WINDOW_FRAMES,
     FEATURE_DIM,
     NONE_CLASS,
     extract_features,
 )
-
-MODEL_PATH = "gesture_model.pkl"
-
-# Minimum probability the winning class needs before we act on it. Raise this
-# if you get false positives; lower it if real gestures are being ignored.
-CONFIDENCE_THRESHOLD = 0.60
 
 
 def load_model(path=MODEL_PATH):

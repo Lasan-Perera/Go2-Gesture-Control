@@ -80,27 +80,18 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-from gesture_common import (
+from config import (
     WINDOW_FRAMES,
+    DATA_DIR,
+    COUNTDOWN_SECONDS,
+    CONTINUOUS_STRIDE,
+)
+from gesture_common import (
     GESTURE_CLASSES,
     NONE_CLASS,
     class_to_slug,
     frame_row,
 )
-
-DATA_DIR = "data"
-COUNTDOWN_SECONDS = 3
-
-# In continuous mode, save a new window every N frames. Set to WINDOW_FRAMES so
-# consecutive samples share NO frames.
-#
-# This matters more than it looks. With a stride of 4 and a 12-frame window,
-# consecutive samples overlap by 8 frames - they are near-duplicates. Those
-# near-duplicates then land on both sides of the train/test split during
-# training, so the model is scored on windows it has effectively already seen.
-# The reported accuracy goes up; live performance does not. Non-overlapping
-# windows keep each saved sample genuinely independent.
-CONTINUOUS_STRIDE = WINDOW_FRAMES
 
 # key -> class label
 KEY_TO_CLASS = {ord(str(i + 1)): label for i, label in enumerate(GESTURE_CLASSES)}

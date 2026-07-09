@@ -7,14 +7,22 @@ Shared building blocks for the gesture-control project. Imported by:
     - train_gestures.py     (training the classifier)
     - gesture_control.py    (live inference)
 
-Deliberately depends on numpy ONLY (no mediapipe, no cv2, no sklearn), so
-that all three scripts compute features through the exact same code path.
-If feature extraction lived separately in the collector and the runner,
-they would eventually drift apart and the model would silently degrade -
-this is the classic "train/serve skew" bug.
+Deliberately depends on numpy and config ONLY (no mediapipe, no cv2, no
+sklearn), so that all three scripts compute features through the exact same
+code path. If feature extraction lived separately in the collector and the
+runner, they would eventually drift apart and the model would silently
+degrade - this is the classic "train/serve skew" bug.
 """
 
 import numpy as np
+
+from config import (
+    WINDOW_FRAMES,
+    SWIPE_DX_THRESH,
+    SIZE_CHANGE_THRESH,
+    STILL_MOTION_THRESH,
+    STOP_HOLD_FRAMES,
+)
 
 # --------------------------------------------------------------------------
 # Sample format
@@ -32,8 +40,6 @@ import numpy as np
 #            the hand moves closer to the camera.
 #   open   : 1.0 if the hand is open (fingers extended), else 0.0
 #   closed : 1.0 if the hand is a fist (fingers curled), else 0.0
-
-WINDOW_FRAMES = 12   # frames per sample. Must match between collection and inference.
 
 COL_T, COL_CX, COL_CY, COL_SIZE, COL_OPEN, COL_CLOSED = range(6)
 
@@ -210,12 +216,7 @@ def extract_features(window):
 # --------------------------------------------------------------------------
 # This is the original hand-tuned logic. gesture_control.py falls back to it
 # if no trained model file is present, so the project still runs end-to-end
-# before you've collected any data.
-
-SWIPE_DX_THRESH = 0.16
-SIZE_CHANGE_THRESH = 0.045
-STILL_MOTION_THRESH = 0.015
-STOP_HOLD_FRAMES = 10
+# before you've collected any data. Thresholds live in config.py.
 
 
 def held_still(pts, n_frames, predicate):

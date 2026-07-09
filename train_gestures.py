@@ -41,8 +41,18 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from gesture_common import (
+from config import (
     WINDOW_FRAMES,
+    DATA_DIR,
+    MODEL_PATH,
+    MIN_SAMPLES_PER_CLASS,
+    RECOMMENDED_PER_CLASS,
+    AUGMENT,
+    N_NOISE_COPIES,
+    NOISE_POS_STD,
+    NOISE_SIZE_STD,
+)
+from gesture_common import (
     FEATURE_DIM,
     GESTURE_CLASSES,
     NONE_CLASS,
@@ -52,17 +62,6 @@ from gesture_common import (
     class_to_slug,
     extract_features,
 )
-
-DATA_DIR = "data"
-MODEL_PATH = "gesture_model.pkl"
-
-MIN_SAMPLES_PER_CLASS = 10   # hard floor - below this, training is meaningless
-RECOMMENDED_PER_CLASS = 25   # soft warning threshold
-
-AUGMENT = True
-N_NOISE_COPIES = 2           # noisy variants per (original, mirrored) window
-NOISE_POS_STD = 0.004        # landmark jitter on palm center, in frame fractions
-NOISE_SIZE_STD = 0.0015      # landmark jitter on the palm-size proxy
 
 # Mirroring a window flips it left<->right, so swipe labels must swap too.
 # Every other class is mirror-symmetric (a fist is a fist either way).
@@ -287,13 +286,18 @@ def main():
 
     # ---- Diagnose the class balance, and advise accordingly ---------------
     print()
+    thin_commands = [c for c in GESTURE_CLASSES
+                     if c != NONE_CLASS and counts.get(c, 0) < RECOMMENDED_PER_CLASS]
     if none_count > 3 * mean_command:
-        print(f"PROBLEM: NONE ({none_count}) dwarfs the command classes "
+        print(f"NOTE: NONE ({none_count}) is much larger than the command classes "
               f"({mean_command:.0f} avg).")
-        print("  Overall accuracy is now inflated and near-meaningless - see the")
-        print("  baseline above. Do NOT record more NONE.")
-        print(f"  Record more of each COMMAND gesture (target ~40 each), or delete")
-        print(f"  some NONE samples, until NONE is only 2-3x the others.")
+        print("  That is FINE, and good for live use - more idle examples means fewer")
+        print("  false-positive gestures. class_weight='balanced' stops it dominating")
+        print("  training. Just never judge this model by the 'accuracy' line: read")
+        print("  macro F1 above, and compare it against the baseline.")
+        if thin_commands:
+            print(f"  Do make sure the command classes are not starved. Thin: "
+                  f"{', '.join(thin_commands)}")
     elif none_count < 1.5 * mean_command:
         print(f"WARNING: NONE has {none_count} samples vs. {mean_command:.0f} average per "
               f"command gesture.")
