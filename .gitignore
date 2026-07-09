@@ -1,0 +1,27 @@
+# Virtual environment - regenerate from requirements.txt
+venv/
+env/
+.venv/
+
+# Biometric data - NEVER COMMIT (regenerate by pressing 'e')
+target_face.npy
+*.npy
+
+# Training data + model - regenerate via collect_gestures.py, train_gestures.py
+data/
+gesture_model.pkl
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

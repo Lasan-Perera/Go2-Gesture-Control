@@ -6,7 +6,7 @@ Standalone, real-time DYNAMIC hand gesture detector, locked to ONE
 enrolled target person's identity via face recognition.
 
 No ROS, no simulator - just: webcam -> face ID -> hand tracking ->
-motion-based gesture classification -> on-screen + console command.
+gesture classification -> on-screen + console command.
 
 Gestures recognized (only while ARMED - see below):
     Swipe hand left   -> "TURN LEFT"
@@ -15,49 +15,44 @@ Gestures recognized (only while ARMED - see below):
     Pull hand back    -> "MOVE BACKWARD"
     Open palm, held   -> "STOP"
 
+Classification (trained model, with rule-based fallback):
+    If gesture_model.pkl exists, gestures are classified by a RandomForest
+    trained on your own recorded samples (see collect_gestures.py and
+    train_gestures.py). The model has an explicit "NONE" class, so it can
+    answer "nothing is happening" instead of being forced to pick a command
+    for every window of hand motion.
+
+    If no trained model is found, the script transparently falls back to the
+    original hand-tuned threshold rules, so it still works end to end.
+
+    Two guards reduce misfires:
+      - CONFIDENCE_THRESHOLD: ignore predictions the model isn't sure about.
+      - CONSECUTIVE_AGREE: require the same prediction on N consecutive
+        frames before acting, so one-off jitter can't trigger a command.
+
 Target-person identity lock (for crowded environments):
     On first run (or whenever target_face.npy is missing), you enroll:
     look at the camera and press 'e' to capture your face. That face
     embedding is saved to disk so you don't need to re-enroll next time.
 
     Every frame, ALL visible faces are compared against your enrolled
-    embedding. Only YOUR face counts as "the target" - regardless of
-    how many other people are in frame, and even after you fully leave
-    and re-enter the frame (no need to re-arm identity, just re-appear).
+    embedding. Only YOUR face counts as "the target" - regardless of how
+    many other people are in frame, and even after you fully leave and
+    re-enter the frame.
 
     The control zone is NOT a fixed box - it dynamically follows your
-    detected face (a region below/around wherever your face currently
-    is). Only a hand inside that zone is ever considered, and only
-    while your face is the one being tracked. Press 'e' any time to
-    re-enroll (e.g. if lighting changes badly or you want to swap who
-    is being tracked).
+    detected face. Only a hand inside that zone is ever considered.
 
-Wake-gesture (arm / disarm) - this is what prevents random/incidental
-hand movement from being treated as a command, even from you:
+Wake-gesture (arm / disarm) - stays rule-based, since "hold still" is
+already reliable and doesn't benefit from being learned:
     - System starts LOCKED (idle). All motion is ignored.
-    - Hold an OPEN palm still, inside your face-anchored zone, for
-      about a second -> system ARMS. Only now do swipe/push/pull/
-      stop commands get dispatched.
-    - Hold a CLOSED FIST still, inside the zone, for about a second
-      while armed -> system DISARMS back to idle/ignoring everything.
-
-How it works (high level):
-    1. Every frame, `face_recognition` finds all faces + their
-       embeddings, and MediaPipe Hands finds up to 2 hands.
-    2. We match the enrolled embedding against detected faces to find
-       YOUR face box, then build a dynamic zone around/below it.
-    3. Whichever detected hand falls inside that zone becomes "the"
-       tracked hand for this frame. Others are drawn but ignored.
-    4. We track that hand's palm center (x, y) and a "palm size" proxy
-       over a short rolling window of recent frames.
-    5. "Dynamic" gestures are detected by looking at how much that
-       center/size CHANGED across the window, not a single frame.
-    6. Once a gesture is confidently classified, we show/print it,
-       then immediately clear the window and go back to watching.
+    - Hold an OPEN palm still, inside your face-anchored zone, for about a
+      second -> system ARMS. Only now are commands dispatched.
+    - Hold a CLOSED FIST still, inside the zone, while armed -> DISARMS.
 
 Install (Ubuntu - dlib needs build tools first):
     sudo apt install -y build-essential cmake libopenblas-dev liblapack-dev
-    pip install opencv-python mediapipe numpy face_recognition
+    pip install -r requirements.txt
 
 Run:
     python3 gesture_control.py
@@ -72,20 +67,33 @@ from collections import deque
 
 import cv2
 import numpy as np
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
+warnings.filterwarnings("ignore", category=UserWarning, module="face_recognition_models")
 import mediapipe as mp
 import face_recognition
 
+from gesture_common import (
+    WINDOW_FRAMES,
+    COL_OPEN,
+    COL_CLOSED,
+    palm_center,
+    frame_row,
+    held_still,
+    classify_gesture_rules,
+)
+from gesture_model import load_model, predict_gesture, CONFIDENCE_THRESHOLD
+
 # --------------------------------------------------------------------------
-# Tunable parameters - adjust these if detection feels too sensitive/insensitive
+# Tunable parameters
 # --------------------------------------------------------------------------
 
-WINDOW_FRAMES = 12          # how many recent frames we look back over to judge motion
-SWIPE_DX_THRESH = 0.16      # min horizontal movement (fraction of frame width) for a swipe
-SIZE_CHANGE_THRESH = 0.045  # min change in palm-size proxy for push/pull
-STILL_MOTION_THRESH = 0.015 # max movement allowed to count as "held still" (for STOP)
-STOP_HOLD_FRAMES = 10       # how many consecutive still+open frames needed to trigger STOP
 DISPLAY_HOLD_SECONDS = 0.9  # how long the detected command stays on screen before resetting
 NO_HAND_RESET_FRAMES = 8    # if hand is lost this many frames, clear the buffer
+
+# Require the model to predict the same gesture this many frames in a row
+# before firing. 1 = fire immediately (twitchy). 2-3 = noticeably steadier.
+CONSECUTIVE_AGREE = 2
 
 # --- Arm / disarm (wake gesture) ---
 ARM_HOLD_FRAMES = 15        # ~0.5-1s of held open palm (inside the zone) to ARM
@@ -94,122 +102,15 @@ ARMED_TIMEOUT_SECONDS = 20  # auto-disarm if no command fires for this long (saf
 
 # --- Face identity lock ---
 ENROLLED_FACE_PATH = "target_face.npy"
-FACE_MATCH_THRESHOLD = 0.55   # lower = stricter match (face_recognition "distance"; 0.6 is their default cutoff)
-FACE_DOWNSCALE = 0.35         # shrink frame before face_recognition for speed (it's slow at full res)
-FACE_DETECT_EVERY_N_FRAMES = 2  # run face ID every Nth frame; reuse last zone in between for smoothness
+FACE_MATCH_THRESHOLD = 0.55   # lower = stricter match (face_recognition "distance")
+FACE_DOWNSCALE = 0.35         # shrink frame before face_recognition for speed
+FACE_DETECT_EVERY_N_FRAMES = 2  # run face ID every Nth frame; reuse last zone in between
 FACE_LOST_GRACE_FRAMES = 10   # keep using the last known zone this many frames after losing the face
 
-# Dynamic control zone, expressed as multiples of the detected face box size,
-# anchored to the face position. This is what "follows you" around the frame.
-ZONE_SIDE_MARGIN = 2.2   # how far left/right of the face the zone extends (x face width)
+# Dynamic control zone, expressed as multiples of the detected face box size.
+ZONE_SIDE_MARGIN = 2.2   # how far left/right of the face the zone extends
 ZONE_ABOVE_MARGIN = 0.3  # how far above the face the zone extends
-ZONE_BELOW_MARGIN = 4.5  # how far below the face the zone extends (down to roughly waist/hands)
-
-# MediaPipe hand landmark indices we need
-WRIST = 0
-INDEX_MCP = 5
-MIDDLE_MCP = 9
-MIDDLE_TIP = 12
-INDEX_TIP = 8
-INDEX_PIP = 6
-MIDDLE_PIP = 10
-RING_TIP = 16
-RING_PIP = 14
-PINKY_TIP = 20
-PINKY_PIP = 18
-
-
-def palm_center(landmarks):
-    """Average of wrist + all MCP (knuckle) points -> stable center of the palm."""
-    idxs = [0, 5, 9, 13, 17]
-    xs = [landmarks[i].x for i in idxs]
-    ys = [landmarks[i].y for i in idxs]
-    return float(np.mean(xs)), float(np.mean(ys))
-
-
-def palm_size(landmarks):
-    """Distance from wrist to middle-finger knuckle - grows as hand moves closer to camera."""
-    wx, wy = landmarks[WRIST].x, landmarks[WRIST].y
-    mx, my = landmarks[MIDDLE_MCP].x, landmarks[MIDDLE_MCP].y
-    return float(np.hypot(mx - wx, my - wy))
-
-
-def is_hand_open(landmarks):
-    """Rough check: are the 4 fingers extended (tip above pip in y, i.e. higher on screen)?"""
-    fingers = [
-        (INDEX_TIP, INDEX_PIP),
-        (MIDDLE_TIP, MIDDLE_PIP),
-        (RING_TIP, RING_PIP),
-        (PINKY_TIP, PINKY_PIP),
-    ]
-    extended = 0
-    for tip, pip in fingers:
-        if landmarks[tip].y < landmarks[pip].y:
-            extended += 1
-    return extended >= 3
-
-
-def is_hand_closed(landmarks):
-    """Rough check: are all 4 fingers curled (tip below/near pip) -> a fist?"""
-    fingers = [
-        (INDEX_TIP, INDEX_PIP),
-        (MIDDLE_TIP, MIDDLE_PIP),
-        (RING_TIP, RING_PIP),
-        (PINKY_TIP, PINKY_PIP),
-    ]
-    curled = 0
-    for tip, pip in fingers:
-        if landmarks[tip].y > landmarks[pip].y:
-            curled += 1
-    return curled >= 3
-
-
-def _held_still(pts, n_frames, predicate):
-    """True if the last n_frames samples are all within STILL_MOTION_THRESH
-    of the first of those frames' position, AND all satisfy `predicate`."""
-    if len(pts) < n_frames:
-        return False
-    window = pts[-n_frames:]
-    x0, y0 = window[0][1], window[0][2]
-    return all(
-        abs(p[1] - x0) < STILL_MOTION_THRESH and
-        abs(p[2] - y0) < STILL_MOTION_THRESH and
-        predicate(p)
-        for p in window
-    )
-
-
-def classify_gesture(buffer):
-    """
-    Look at the rolling buffer of (t, cx, cy, size, open, closed) samples
-    and decide if a dynamic MOVEMENT gesture just happened. Returns a
-    command string or None.
-    """
-    if len(buffer) < WINDOW_FRAMES:
-        return None
-
-    pts = list(buffer)[-WINDOW_FRAMES:]
-    cx0, cy0, size0 = pts[0][1], pts[0][2], pts[0][3]
-    cx1, cy1, size1 = pts[-1][1], pts[-1][2], pts[-1][3]
-
-    dx = cx1 - cx0
-    dy = cy1 - cy0
-    dsize = size1 - size0
-
-    horiz = abs(dx)
-    vert = abs(dy)
-
-    if horiz > SWIPE_DX_THRESH and horiz > vert * 1.5 and abs(dsize) < SIZE_CHANGE_THRESH * 1.5:
-        return "TURN RIGHT" if dx > 0 else "TURN LEFT"
-        # frame is mirrored (selfie view), so dx > 0 = viewer's right = robot's right.
-
-    if abs(dsize) > SIZE_CHANGE_THRESH and horiz < SWIPE_DX_THRESH * 0.7 and vert < SWIPE_DX_THRESH * 0.7:
-        return "MOVE FORWARD" if dsize > 0 else "MOVE BACKWARD"
-
-    if _held_still(pts, STOP_HOLD_FRAMES, lambda p: p[4]):
-        return "STOP"
-
-    return None
+ZONE_BELOW_MARGIN = 4.5  # how far below the face the zone extends
 
 
 # --------------------------------------------------------------------------
@@ -227,15 +128,12 @@ def save_enrolled_face(encoding):
 
 
 def enroll_from_frame(frame_bgr):
-    """
-    Find the largest face in this frame and return its encoding, or None
-    if no face was found. Used for both first-time and re-enrollment.
-    """
+    """Find the largest face in this frame and return its encoding, or None."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     locations = face_recognition.face_locations(rgb, model="hog")
     if not locations:
         return None
-    # pick the largest face box (closest to camera = most likely the operator)
+    # largest face box = closest to camera = most likely the operator
     locations.sort(key=lambda box: (box[2] - box[0]) * (box[1] - box[3]), reverse=True)
     encodings = face_recognition.face_encodings(rgb, known_face_locations=[locations[0]])
     if not encodings:
@@ -246,9 +144,8 @@ def enroll_from_frame(frame_bgr):
 def find_target_face(frame_bgr, enrolled_encoding):
     """
     Detect faces in a downscaled copy of the frame, compare each to the
-    enrolled encoding, and return the best match's bounding box scaled
-    back to full-frame pixel coordinates: (top, right, bottom, left).
-    Returns None if no good match this frame.
+    enrolled encoding, and return the best match's box in full-frame pixel
+    coordinates: (top, right, bottom, left). None if no good match.
     """
     small = cv2.resize(frame_bgr, (0, 0), fx=FACE_DOWNSCALE, fy=FACE_DOWNSCALE)
     rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -290,10 +187,9 @@ def in_zone_px(cx_px, cy_px, zone):
 
 def pick_zone_hand(multi_hand_landmarks, zone, frame_w, frame_h):
     """
-    Among all detected hands, return the landmark list + index of whichever
-    one falls inside the dynamic zone. If more than one qualifies, pick the
-    one closest to the zone's horizontal center (most likely the real arm,
-    not a stray hand at the zone's edge).
+    Among all detected hands, return the landmarks + index of whichever falls
+    inside the dynamic zone. If several qualify, pick the one nearest the
+    zone's horizontal center.
     """
     if not multi_hand_landmarks or zone is None:
         return None, None
@@ -332,6 +228,17 @@ def main():
         print("ERROR: could not open webcam (device 0). Check camera permissions/connection.")
         return
 
+    # --- Classifier: trained model if present, else the original rules ---
+    bundle = load_model()
+    if bundle is not None:
+        print(f"Loaded trained model ({bundle['n_samples']} training samples, "
+              f"{len(bundle['classes'])} classes).")
+        print(f"Confidence threshold {CONFIDENCE_THRESHOLD}, "
+              f"requires {CONSECUTIVE_AGREE} agreeing frames.")
+    else:
+        print("No trained model found - using rule-based thresholds.")
+        print("  To train one:  python3 collect_gestures.py   then   python3 train_gestures.py")
+
     enrolled_encoding = load_enrolled_face()
     if enrolled_encoding is None:
         print("No enrolled face found. Look at the camera and press 'e' to enroll.")
@@ -339,9 +246,11 @@ def main():
         print(f"Loaded enrolled face from {ENROLLED_FACE_PATH}. Press 'e' any time to re-enroll.")
 
     buffer = deque(maxlen=max(WINDOW_FRAMES, ARM_HOLD_FRAMES, DISARM_HOLD_FRAMES))
+    pred_history = deque(maxlen=CONSECUTIVE_AGREE)
     no_hand_count = 0
 
     display_command = None
+    display_conf = 0.0
     display_until = 0.0
 
     armed = False
@@ -396,6 +305,7 @@ def main():
         hand_result = hands.process(rgb)
 
         detected_this_frame = None
+        detected_conf = 0.0
         hand_in_zone = False
 
         landmarks, target_idx = pick_zone_hand(hand_result.multi_hand_landmarks, zone, w, h)
@@ -414,47 +324,60 @@ def main():
         if landmarks is not None:
             no_hand_count = 0
             hand_in_zone = True
-
-            cx, cy = palm_center(landmarks)
-            size = palm_size(landmarks)
-            open_hand = is_hand_open(landmarks)
-            closed_hand = is_hand_closed(landmarks)
-            buffer.append((now, cx, cy, size, open_hand, closed_hand))
+            buffer.append(frame_row(now, landmarks))
 
             if now >= display_until:
                 if not armed:
-                    pts = list(buffer)
-                    if _held_still(pts, ARM_HOLD_FRAMES, lambda p: p[4]):
+                    # Idle: the only thing we look for is the arm (wake) gesture.
+                    if held_still(buffer, ARM_HOLD_FRAMES, lambda p: p[COL_OPEN] > 0.5):
                         armed = True
                         armed_since = now
                         buffer.clear()
+                        pred_history.clear()
                         print("[ARMED] Now listening for movement commands.")
                 else:
-                    pts = list(buffer)
-                    if _held_still(pts, DISARM_HOLD_FRAMES, lambda p: p[5]):
+                    # Armed: check disarm first, then classify.
+                    if held_still(buffer, DISARM_HOLD_FRAMES, lambda p: p[COL_CLOSED] > 0.5):
                         armed = False
                         buffer.clear()
+                        pred_history.clear()
                         print("[DISARMED] Back to locked/idle.")
                     else:
-                        cmd = classify_gesture(buffer)
-                        if cmd is not None:
-                            detected_this_frame = cmd
+                        if bundle is not None:
+                            cmd, conf = predict_gesture(buffer, bundle)
+                        else:
+                            cmd, conf = classify_gesture_rules(buffer), 1.0
+
+                        # Smoothing: only act once the same command has been
+                        # predicted on CONSECUTIVE_AGREE frames in a row.
+                        if cmd is None:
+                            pred_history.clear()
+                        else:
+                            pred_history.append((cmd, conf))
+                            if (len(pred_history) == CONSECUTIVE_AGREE and
+                                    len({c for c, _ in pred_history}) == 1):
+                                detected_this_frame = cmd
+                                detected_conf = float(np.mean([c for _, c in pred_history]))
         else:
             no_hand_count += 1
             if no_hand_count >= NO_HAND_RESET_FRAMES:
                 buffer.clear()
+                pred_history.clear()
 
         if armed and (now - armed_since) > ARMED_TIMEOUT_SECONDS and now >= display_until:
             armed = False
             buffer.clear()
+            pred_history.clear()
             print("[DISARMED] Timed out with no commands.")
 
         if detected_this_frame is not None:
             display_command = detected_this_frame
+            display_conf = detected_conf
             display_until = now + DISPLAY_HOLD_SECONDS
             armed_since = now
             buffer.clear()
-            print(f"[GESTURE DETECTED] -> {display_command}")
+            pred_history.clear()
+            print(f"[GESTURE DETECTED] -> {display_command}  ({display_conf:.0%})")
 
         # --- Draw the dynamic, face-anchored control zone ---
         if zone is not None:
@@ -467,8 +390,11 @@ def main():
         # --- Status bar ---
         if now < display_until and display_command is not None:
             cv2.rectangle(frame, (0, 0), (w, 70), (0, 130, 0), -1)
-            cv2.putText(frame, display_command, (20, 48),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3)
+            label = display_command
+            if bundle is not None:
+                label += f"  ({display_conf:.0%})"
+            cv2.putText(frame, label, (20, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3)
         else:
             display_command = None
             bar_color = (0, 110, 0) if armed else (60, 60, 60)
@@ -487,6 +413,10 @@ def main():
                 status = "target found - show hand in your zone"
             cv2.putText(frame, status, (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            mode = "model" if bundle is not None else "rules"
+            cv2.putText(frame, mode, (w - 70, h - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
 
         cv2.imshow("Dynamic Gesture Control (face-locked)", frame)
 
