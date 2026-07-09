@@ -193,6 +193,3 @@ new location.
 └── README.md
 ```
 
-## License
-
-MIT (or update to whatever license you've chosen for the repo).
