@@ -49,7 +49,7 @@ ARM_HOLD_FRAMES = 15         # frames of held open palm (inside the zone) to ARM
 DISARM_HOLD_FRAMES = 15      # frames of held closed fist (inside the zone) to DISARM
 ARMED_TIMEOUT_SECONDS = 20   # auto-disarm if no command fires for this long
 
-# SAFETY: disarm the moment the enrolled operator's face leaves the frame.
+# SAFETY: disarm once the enrolled operator's face has been gone for a while.
 #
 # Without this, walking out of shot while ARMED leaves the system armed. You
 # return some time later and the very first hand movement you make - reaching
@@ -58,6 +58,22 @@ ARMED_TIMEOUT_SECONDS = 20   # auto-disarm if no command fires for this long
 #
 # Re-arming should always be a deliberate act.
 DISARM_ON_FACE_LOST = True
+
+# How long the face must be CONTINUOUSLY missing before we disarm.
+#
+# This is deliberately much longer than FACE_ZONE_GRACE_SECONDS below. They
+# answer different questions:
+#
+#   "keep using the last known control zone?"  -> your face has not teleported,
+#                                                 a short grace is plenty
+#   "has the operator actually left?"          -> needs a long grace; raising
+#                                                 your hand in front of your own
+#                                                 face while gesturing is normal,
+#                                                 and must not disarm you
+#
+# Set generously. Occlusion by your own hand, turning your head, or a person
+# walking past should all ride through this untouched.
+DISARM_GRACE_SECONDS = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -69,7 +85,13 @@ ENROLLED_FACE_PATH = "target_face.npy"
 FACE_MATCH_THRESHOLD = 0.55     # lower = stricter (face_recognition "distance")
 FACE_DOWNSCALE = 0.35           # shrink the frame before face detection, for speed
 FACE_DETECT_EVERY_N_FRAMES = 2  # run face ID every Nth frame; reuse the zone between
-FACE_LOST_GRACE_FRAMES = 10     # keep the last known zone this long after losing the face
+
+# How long to keep using the last known control zone after losing the face.
+#
+# Time-based, not frame-count-based, on purpose. A frame count silently means
+# something different at 30 fps than at 10 fps - and this pipeline's frame rate
+# swings with dlib's mood. Seconds mean seconds.
+FACE_ZONE_GRACE_SECONDS = 1.5
 
 # Control zone, as multiples of the detected face box. This is what follows
 # you around the frame.

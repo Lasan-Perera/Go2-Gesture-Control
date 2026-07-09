@@ -73,8 +73,11 @@ being learned.
     - Hold an OPEN palm still, inside your zone -> ARMS.
     - Hold a CLOSED FIST still, inside your zone -> DISARMS.
     - Auto-disarms after ARMED_TIMEOUT_SECONDS of no commands.
-    - Auto-disarms the moment your face leaves the frame (see
-      config.DISARM_ON_FACE_LOST). Re-arming is always deliberate.
+    - Auto-disarms once your face has been continuously missing for
+      DISARM_GRACE_SECONDS (default 5s). Briefly occluding your own face with
+      the gesturing hand is expected and does NOT disarm you - the control
+      zone simply persists for FACE_ZONE_GRACE_SECONDS. Re-arming is always
+      deliberate.
 
 
 Install (Ubuntu - dlib needs build tools first):
@@ -324,7 +327,11 @@ def run(dispatch=print_dispatch, camera_index=0):
 
     frame_idx = 0
     last_face_box = None
-    frames_since_face_seen = config.FACE_LOST_GRACE_FRAMES + 1  # start as "not seen"
+    # Timestamp of the last SUCCESSFUL face match. Using a timestamp rather
+    # than a frame counter fixes two bugs at once: the old counter ticked up on
+    # frames where face detection never even ran (we only detect every Nth
+    # frame), and a frame count means something different at 30 fps than at 10.
+    last_face_seen_t = 0.0  # 0.0 = never seen
 
     perf = Perf()
     last_frame_t = time.time()
@@ -375,22 +382,27 @@ def run(dispatch=print_dispatch, camera_index=0):
             perf.face(time.time() - t0)
             if face_box is not None:
                 last_face_box = face_box
-                frames_since_face_seen = 0
-            else:
-                frames_since_face_seen += 1
-        else:
-            frames_since_face_seen += 1
+                last_face_seen_t = now
+        # NOTE: no `else` branch. Frames where we simply didn't look must not
+        # count as evidence that the face is gone.
 
+        face_gone_for = (now - last_face_seen_t) if last_face_seen_t > 0 else float("inf")
+
+        # Keep using the last known zone through brief losses - your face has
+        # not teleported, and you may well be occluding it with the very hand
+        # you are gesturing with.
         target_visible = (enrolled_encoding is not None
-                          and frames_since_face_seen <= config.FACE_LOST_GRACE_FRAMES)
+                          and face_gone_for <= config.FACE_ZONE_GRACE_SECONDS)
         zone = (zone_from_face_box(last_face_box, w, h)
                 if (target_visible and last_face_box) else None)
 
-        # --- SAFETY: never stay armed once the operator is out of frame ---
-        # Otherwise you walk away armed, return, and your first incidental hand
-        # movement is dispatched as a command.
-        if armed and not target_visible and config.DISARM_ON_FACE_LOST:
-            disarm("target face lost")
+        # --- SAFETY: never stay armed once the operator has really gone ---
+        # Deliberately a much longer grace than the zone one above: a hand
+        # sweeping across your face is not you walking away, and disarming on
+        # that would make the system unusable.
+        if (armed and config.DISARM_ON_FACE_LOST
+                and face_gone_for > config.DISARM_GRACE_SECONDS):
+            disarm(f"target face gone for {config.DISARM_GRACE_SECONDS:.0f}s")
 
         # --- Hand detection ---
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -488,6 +500,10 @@ def run(dispatch=print_dispatch, camera_index=0):
             cv2.rectangle(frame, (0, 0), (w, 40), bar_color, -1)
             if enrolled_encoding is None:
                 status = "NOT ENROLLED - press 'e' to enroll your face"
+            elif armed and not target_visible:
+                # Occluded but still armed - show the countdown to auto-disarm.
+                remaining = max(0.0, config.DISARM_GRACE_SECONDS - face_gone_for)
+                status = f"ARMED - face hidden, disarming in {remaining:.1f}s"
             elif not target_visible:
                 status = "target face not visible..."
             elif armed:
