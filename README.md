@@ -1,310 +1,264 @@
 # Go2 Gesture Control
 
-Real-time **dynamic hand gesture recognition**, locked to a single enrolled
-operator via face recognition, driven by a **classifier trained on your own
-recordings** rather than hand-tuned thresholds.
+Real-time hand-gesture recognition for the **Unitree Go2**, built as Layer 2
+(Contextual Gesture Response) of a socially-aware navigation system driven by
+an Interval Type-2 Fuzzy Logic System (IT2-FLS).
 
-Built as a standalone control interface for navigating a simulated Unitree Go2
-robot dog. It's a companion to
-[`go2-social-nav`](https://github.com/KaveeshwaraBandara/go2-social-nav) — a
-ROS 2 + Gazebo simulation where a Go2 navigates among simulated pedestrians —
-with the goal of replacing keyboard teleop with hand gestures.
+Part of the WSO2-sponsored research project at the University of Moratuwa.
+Companion repos: the simulation
+([`go2-social-nav`](https://github.com/Lasan-Perera/go2-social-nav)) and the
+LiDAR-camera fusion pipeline
+([`lidar-cam-fusion-lab`](https://github.com/KaveeshwaraBandara/lidar-cam-fusion-lab)).
 
-Right now it runs **standalone**: webcam in, gesture command out. The detection
-pipeline was deliberately built and validated on its own before being wired
-into ROS 2's `/cmd_vel`.
+---
 
-## Gestures
+## What this component does
 
-| Gesture | Motion | Command |
-|---|---|---|
-| Swipe hand left | fast horizontal motion, left | `TURN LEFT` |
-| Swipe hand right | fast horizontal motion, right | `TURN RIGHT` |
-| Push hand toward camera | palm grows larger | `MOVE FORWARD` |
-| Pull hand away | palm shrinks | `MOVE BACKWARD` |
-| Open palm, held still | no significant motion, palm open | `STOP` |
+The robot must respond to human gestures — but not with a fixed reaction every
+time. A "come here" in an open corridor should trigger a direct approach; the
+same gesture in a crowd should trigger a slower, replanned path. That
+context-sensitivity is the job of the fuzzy engine, not this node.
 
-A sixth class, `NONE`, is the most important one — see
-[Why NONE matters](#why-none-matters).
+**This node's job is narrower and deliberate:** recognise *which* gesture an
+*enrolled operator* is performing, with a confidence score, and publish that as
+*intent* — never as a velocity command. The fuzzy engine is the only thing that
+touches `/cmd_vel`. Keeping gesture recognition free of motor commands is what
+lets the same gesture mean different things in different contexts.
 
-## Why this is more than hand tracking
-
-A naive gesture demo reacts to *any* hand movement from *anyone* in view.
-Three layers sit on top of raw MediaPipe hand tracking to make this usable in a
-real environment:
-
-**1. Trained classifier, not thresholds.**
-Gestures are recognized by a RandomForest trained on windows of your own
-recorded hand motion. Features are normalized by palm size, so a swipe
-performed 1 m from the camera looks the same to the model as one at 2 m —
-something fixed pixel thresholds fundamentally cannot do. The model has an
-explicit `NONE` class, so it can answer *"nothing is happening"* rather than
-being forced to label every window as some command.
-
-**2. Arm / disarm wake gesture.**
-The system starts **locked**, ignoring all motion. Hold an open palm still for
-about a second to **arm** it; only then are commands dispatched. Hold a closed
-fist still to **disarm**. This stops incidental movement — talking with your
-hands, scratching your face, adjusting your glasses — from being read as
-commands. It stays rule-based, because "hold still" is already reliable and
-gains nothing from being learned.
-
-**3. Face-recognition identity lock.**
-Enroll your face once (press `e`). Every frame, the system identifies *your*
-face among everyone visible and builds a control zone that follows you around
-the frame. Other people's hands are drawn in gray and never treated as
-commands. Because it's identity-based rather than positional, you can leave the
-frame entirely, or be blocked by someone walking past, and control resumes the
-moment your face is visible again.
-
-## Requirements
-
-- Ubuntu (tested on 22.04 / 24.04) with a working webcam
-- Python 3.12
-- Decent, even lighting — face and hand detection both degrade in the dark
-
-## Installation
-
-**1. Install system build tools.** `face_recognition` depends on `dlib`, which
-compiles from source and has no prebuilt wheel:
-
-```bash
-sudo apt install -y build-essential cmake libopenblas-dev liblapack-dev
+```
+camera  ->  hand + pose landmarks  ->  operator lock  ->  gesture classifier
+                                                                  |
+                                                                  v
+                                                     GestureIntent  (label,
+                                                     confidence, operator
+                                                     distance/bearing)
+                                                                  |
+                                                                  v
+                                                          IT2-FLS  ->  /cmd_vel
 ```
 
-**2. Clone and create a virtual environment:**
+---
+
+## Current status
+
+Active development. The pipeline is being built and validated standalone
+(webcam in, intent out) before ROS 2 integration, following a phase-gated
+roadmap.
+
+| Phase | Work | Status |
+|---|---|---|
+| P0 | Gesture vocabulary + interface spec | done |
+| P2 | Migrate to MediaPipe **Tasks API** | done |
+| P3 | Pose estimation benchmark (wrists for operator lock) | done |
+| P5 | Record dataset (robot viewpoint, multiple people) | next |
+| P8 | Operator lock (hand-to-wrist association) | planned |
+| P9 | ROS 2 node publishing `GestureIntent` | planned |
+
+The earlier face-recognition operator lock is **frozen** on branch
+`face-identity-lock` (tag `v0.1-face-lock`) and replaced by a pose-based
+approach — see [Operator lock](#operator-lock-in-progress).
+
+---
+
+## Gesture vocabulary
+
+Six commands plus a wake gesture, chosen so that most have a genuinely
+context-dependent response (the point of the whole system). One-handed, either
+hand.
+
+| Gesture | Type | Static/Dynamic | Context-sensitive |
+|---|---|---|---|
+| **Attention** (wake) | precondition | static | — |
+| **Come** | goal | dynamic | high |
+| **Follow** | mode | static | high |
+| **Stop** | safety | static | no (by design) |
+| **Stay** | mode | static | medium |
+| **Back off** | constraint | dynamic | high |
+| **Release** | mode exit | dynamic | no |
+
+`Stop` is intentionally context-free: a safety command whose meaning varies is
+not a safety command. `Come`, `Follow`, and `Back off` are where the fuzzy
+engine earns its keep — `Back off` especially, because whether the robot *can*
+comply depends on the free space behind it.
+
+A `NONE` class ("hand visible, no command") is the most important class for
+avoiding false triggers. See [Why NONE matters](#why-none-matters).
+
+---
+
+## How recognition works
+
+**Windowed motion, not single frames.** A gesture is classified from a window
+of `WINDOW_FRAMES` consecutive frames (palm centre, palm size, open/closed
+flags), so dynamic gestures like a beckon or a push are representable — a
+per-frame pose classifier could not represent them.
+
+**Scale-normalized features.** Displacement is measured relative to the
+window's first frame and divided by palm size (a distance proxy), so a gesture
+performed 1 m from the camera looks the same to the model as one at 2 m. Fixed
+pixel thresholds cannot do this.
+
+**RandomForest, not an LSTM.** With the sample counts realistic for a
+hand-recorded dataset, a forest over engineered motion features trains in
+seconds, predicts in microseconds (no added latency in the live loop), needs no
+feature scaling, and gives usable class probabilities for a confidence
+threshold. That confidence is passed onward as a *fuzzy antecedent*, never
+thresholded to a hard yes/no — thresholding it would discard the uncertainty
+the IT2-FLS exists to absorb.
+
+**Shared feature code.** `gesture_common.py` is imported by collection,
+training, and inference so all three compute features through the exact same
+path. Splitting that logic is the classic route to train/serve skew.
+
+---
+
+## Hand tracking: MediaPipe Tasks API
+
+The pipeline uses the **MediaPipe Tasks API** (`HandLandmarker`), not the
+deprecated `mp.solutions`. The swap is isolated in `hand_landmarker.py`, a thin
+`HandTracker` wrapper that returns landmarks in the same shape the old API
+produced — so nothing downstream changed.
+
+Why the Tasks API:
+
+- The legacy `mp.solutions` API is deprecated and already breaks on current
+  MediaPipe (the reason the old code was pinned to `mediapipe==0.10.14`). That
+  pin is gone.
+- The Tasks API uses a portable `.task` model bundle — the only realistic path
+  onto the Jetson Orin NX, which is where this must ultimately run.
+- VIDEO running mode tracks the hand across frames using the previous frame's
+  box, giving the steadiness the windowed features depend on.
+- Handedness comes for free, which the operator lock will use.
+
+The migration was verified with `verify_migration.py`, which runs both APIs on
+the same frames: palm-centre agreement was within ~0.6% of frame width, and the
+open-palm flag agreed on 99% of frames — confirming a model trained on either
+API behaves the same.
+
+---
+
+## Operator lock (in progress)
+
+The robot must obey **one** enrolled operator, not any hand in view. The
+original design used face recognition; it is frozen and being replaced, because:
+
+- During `Follow`, the robot sees the operator's back — no face to recognise.
+- From a camera ~45 cm off the floor tilted up, a standing person's face is
+  often just the chin.
+- `dlib`'s HOG detector is CPU-only and the pipeline's bottleneck; it would be
+  worse on ARM.
+- Storing facial embeddings of study participants complicates ethics approval.
+
+The replacement uses **body pose** instead of face identity:
+
+1. **Pose estimation** (MediaPipe Pose Landmarker) gives body keypoints,
+   including wrists. Benchmarked in P3: reliable wrists at the robot's low,
+   tilted-up angle, ~16–17 fps running alongside hand tracking.
+2. **Hand-to-wrist association** matches each detected hand to the nearest body
+   wrist and discards hands that aren't the operator's — so a bystander's wave
+   is ignored. This is the actual exclusivity mechanism (face never provided
+   it).
+3. **Enrol by action:** whoever performs the wake gesture becomes the operator,
+   identified by track ID — no face database.
+4. **Re-acquisition** after occlusion via a lightweight appearance embedding
+   (clothing/build, not face) is planned for later.
+
+Operator identity confidence is passed to the fuzzy engine as an input, not a
+gate: low confidence makes the robot cautious rather than inert.
+
+---
+
+## Repository layout
+
+| File | Role |
+|---|---|
+| `hand_landmarker.py` | MediaPipe Tasks API wrapper (`HandTracker`) |
+| `gesture_common.py` | Landmark helpers, feature extraction, class list |
+| `gesture_model.py` | Model loading + inference (headless-testable) |
+| `collect_gestures.py` | Record labeled training samples |
+| `train_gestures.py` | Train, evaluate, save the classifier |
+| `gesture_control.py` | Live application (webcam in, intent out) |
+| `config.py` | All tunable constants |
+| `verify_migration.py` | Confirms Tasks API matches the legacy API |
+| `benchmark_pose.py` | P3 pose benchmark (fps + wrist reliability) |
+| `models/` | `.task` model bundles (committed) |
+
+---
+
+## Setup
+
+Requires Python 3.12, Ubuntu, a webcam, and even lighting (detection degrades
+in the dark).
 
 ```bash
 git clone https://github.com/Lasan-Perera/Go2-Gesture-Control
 cd Go2-Gesture-Control
 python3 -m venv venv
 source venv/bin/activate
-```
-
-**3. Install Python dependencies:**
-
-```bash
 pip install -r requirements.txt
 ```
 
-This compiles `dlib` and can take several minutes. That's expected, not a hang.
+Download the model bundles once (not pip dependencies):
+
+```bash
+mkdir -p models
+curl -L -o models/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+curl -L -o models/pose_landmarker_full.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
+```
+
+---
 
 ## Usage
 
-There are three scripts, run in order. The first two are one-time setup.
-
-### Step 1 — Record training samples
+Three scripts, run in order. The first two are one-time setup per dataset.
 
 ```bash
+# 1. Record samples (see the script header for per-class guidance)
 python3 collect_gestures.py
-```
 
-| Key | Action |
-|---|---|
-| `1`–`6` | select which gesture to record |
-| `SPACE` | record ONE sample (3-2-1 countdown) |
-| `c` | toggle continuous recording |
-| `u` | undo the last sample |
-| `q` | quit |
-
-**For the 5 command gestures:** select with `1`–`5`, then `SPACE`, one at a
-time. Aim for **~40 samples each**. Vary distance from the camera, speed, and
-which hand you use — *variety matters far more than raw count*. A model can't
-learn a gesture you perform four different ways from a handful of examples.
-
-**For NONE:** press `6`, then `c`, then move your hand around aimlessly for
-about a minute. Drift, fidget, scratch your face, reach in and out of frame,
-gesture while talking. Aim for **~100 samples**.
-
-Samples are written to `data/<CLASS>/sample_NNNN.npy`.
-
-### Step 2 — Train
-
-```bash
+# 2. Train and evaluate
 python3 train_gestures.py
-```
 
-Reads `data/`, trains a RandomForest, evaluates it honestly, and writes
-`gesture_model.pkl`.
-
-**Read the output carefully:**
-
-- **Macro F1** is the number that matters. It weights every class equally.
-- **Ignore the `accuracy` line.** With a large NONE class, accuracy is close to
-  worthless — the script prints the score a model would get by *always*
-  answering NONE, so you can see for yourself.
-- **The confusion matrix** shows which gestures bleed into each other.
-  Off-diagonal cells are your real problems.
-
-Target **macro F1 ≥ 0.90**. Below ~0.80, more data alone may not help — look at
-the matrix and fix the specific classes that are colliding.
-
-Expect to iterate: record → train → read the matrix → record more. That
-iteration *is* the work.
-
-### Step 3 — Run
-
-```bash
+# 3. Run live
 python3 gesture_control.py
 ```
 
-**First run:** look at the camera and press `e` to enroll your face. This saves
-`target_face.npy`; you won't need to do it again. Press `e` any time to
-re-enroll (different lighting, or to hand control to someone else).
+`train_gestures.py` reports **macro F1** as the headline metric (not accuracy,
+which a large NONE class makes meaningless) and prints a confusion matrix.
+Off-diagonal cells are the gestures bleeding into each other. Target macro F1
+≥ 0.90.
 
-**Then:**
-1. Status bar shows `LOCKED` until your face is recognized.
-2. Hold an **open palm still** inside the control zone → `ARMED`.
-3. Perform any gesture. It flashes on screen with a confidence score and prints
-   to the console.
-4. Hold a **closed fist still** to `DISARM`. It also auto-disarms after ~20 s
-   of inactivity.
-5. Press `q` (with the video window focused) to quit.
-
-If no trained model is found, the script transparently falls back to the
-original threshold rules and shows `rules` in the corner, so it always runs.
+---
 
 ## Why NONE matters
 
-`NONE` is the class for *"my hand is visible but I am not commanding
-anything."* It is the single biggest determinant of whether this works.
+`NONE` is "my hand is visible but I'm not commanding anything." It is the single
+biggest determinant of whether this works live. A classifier trained on only the
+command gestures is forced to label *every* window as some command — including a
+hand at rest — and misfires constantly.
 
-A classifier trained on only the 5 real gestures is mathematically forced to
-assign every window it sees to one of them — including your hand simply
-resting, or drifting between positions. The result is constant misfiring.
+Two rules, both learned the hard way:
 
-Two mistakes to avoid, both learned the hard way:
+- **Don't record `Stop` as `NONE`.** `Stop` is an open palm held still. Resting
+  an open hand during a NONE session labels `Stop` as `NONE`; both classes
+  degrade. During NONE, keep the hand moving, or closed if still.
+- **A large NONE class is good** — biggest class by 2–3×. `class_weight="balanced"`
+  stops it dominating training.
 
-**Don't record STOP as NONE.** `STOP` is *"open palm, held still."* If you rest
-your open hand in front of the camera during a NONE session, you are recording
-STOP and labelling it NONE. The model receives directly contradictory labels
-and both classes degrade. During NONE sessions, keep your hand **moving**, or
-keep it **closed** if it's still.
+---
 
-**A large NONE class is good.** It should be your biggest class by 2–3x or
-more. It teaches the model what idle looks like, across variety, and
-`class_weight="balanced"` stops it dominating training. Just never judge the
-model by raw accuracy once it's large.
+## Notes for deployment
 
-## Architecture
+Target hardware is the **Jetson Orin NX** (aarch64) on the Go2. Two things to
+validate before deployment:
 
-```
-webcam frame
-    │
-    ├─→ face_recognition (dlib) ──→ is this MY face?  ──→ control zone (follows the face)
-    │                                                            │
-    └─→ MediaPipe Hands ──→ which hand is inside the zone? ──────┘
-                                    │
-                                    ▼
-                        rolling buffer of 12 frames
-                     (palm center, palm size, open, closed)
-                                    │
-                     ┌──────────────┴──────────────┐
-                     ▼                             ▼
-            arm/disarm (rules)          extract_features() → RandomForest
-            "held still + open"                    │
-            "held still + fist"          confidence ≥ 0.60?
-                                         2 consecutive frames agree?
-                                                   │
-                                                   ▼
-                                            command dispatched
-```
+- MediaPipe has no official aarch64 wheel; the Jetson build is a separate,
+  from-source effort. The Tasks API `.task` bundles are the portable path.
+- Pose Landmarker `full` was chosen for steady wrists on the laptop GPU; if it's
+  too slow on the Orin NX, the fallback is `lite` plus a smoothing filter
+  (higher fps, jitter removed in software).
 
-### Files
-
-| File | Role |
-|---|---|
-| `gesture_common.py` | Landmark helpers, feature extraction, class list, rule-based fallback |
-| `gesture_model.py` | Model loading + inference (no webcam needed — testable headless) |
-| `collect_gestures.py` | Record labeled training samples |
-| `train_gestures.py` | Train, evaluate, save the classifier |
-| `gesture_control.py` | The live application |
-
-`gesture_common.py` is imported by all three entry points so that collection,
-training, and inference compute features through **the exact same code**.
-Splitting that logic is the classic way to get train/serve skew — a model that
-scores 97% in testing and behaves badly on your webcam.
-
-### Design decisions
-
-**RandomForest, not an LSTM.** With ~40–100 samples per class on a CPU-only
-laptop, a forest over engineered motion features is the right tool: trains in
-seconds, predicts in microseconds (no added latency in the live loop), needs no
-feature scaling, and gives usable class probabilities for a confidence
-threshold. An LSTM would need TensorFlow/PyTorch, far more data, and would add
-real lag to a pipeline already fighting for frames.
-
-**Features are scale-normalized, not translation-augmented.** Displacement is
-measured relative to the window's first frame and divided by palm size.
-A consequence worth knowing: shifting or uniformly rescaling a window leaves
-its feature vector *bit-identical*, so translation and scale augmentation would
-add nothing but duplicate rows. Mirroring and landmark noise are the
-augmentations that actually carry signal.
-
-**Augmentation never touches test data.** Mirroring a test sample into the
-training set would leak it across the split and inflate the reported score.
-`train_gestures.py` augments each training fold only.
-
-**Continuous recording windows don't overlap.** With a stride shorter than the
-window, consecutive samples share most of their frames — they're
-near-duplicates, and they land on both sides of the train/test split, inflating
-scores without improving live behavior.
-
-## Tuning
-
-Live behavior is the only test that counts. Tune from what you observe:
-
-| Symptom | Fix |
-|---|---|
-| Fires while your hand idles | `CONFIDENCE_THRESHOLD` 0.60 → 0.75 in `gesture_model.py` |
-| Still twitchy / double-fires | `CONSECUTIVE_AGREE` 2 → 3 in `gesture_control.py` |
-| Real gestures ignored | `CONFIDENCE_THRESHOLD` down to 0.50 |
-| Face lock too strict / too loose | `FACE_MATCH_THRESHOLD` in `gesture_control.py` (lower = stricter) |
-| Control zone wrong size | `ZONE_*_MARGIN` constants in `gesture_control.py` |
-| Laggy | raise `FACE_DETECT_EVERY_N_FRAMES`, lower `FACE_DOWNSCALE` |
-
-## Known issues
-
-**`AttributeError: module 'mediapipe' has no attribute 'solutions'`**
-A packaging regression in mediapipe 0.10.31–0.10.35 on Python 3.12 breaks the
-legacy `mp.solutions` API. `requirements.txt` pins `mediapipe==0.10.14`, the
-last known-good version.
-
-**`ModuleNotFoundError: No module named 'pkg_resources'`**
-`face_recognition_models` still imports the deprecated `pkg_resources`, which
-`setuptools >= 82.0.0` (Feb 2026) removed. `requirements.txt` pins
-`setuptools<82`. You'll still see a *deprecation warning* — that's harmless.
-
-**It's laggy.** `dlib`'s HOG face detector is CPU-only and by far the heaviest
-part of the pipeline. Accepted for now. A background-threaded face detector,
-decoupling video display from detection latency, is the next real fix.
-
-**`MOVE BACKWARD` sometimes reads as `STOP`.** A genuine ambiguity in the
-feature space: a palm shrinking slowly is hard to distinguish from a palm held
-still while drifting away from the camera. Pull back sharply and decisively.
-More data does not fix this one.
-
-**A venv broke after moving its folder.** Python venvs bake in absolute paths at
-creation. Delete and recreate it in the new location.
-
-## What is not committed
-
-`.gitignore` excludes, deliberately:
-
-- `venv/` — regenerate from `requirements.txt`
-- `target_face.npy` — a face embedding. Personal biometric data, and useless to
-  anyone else since their face won't match it. Regenerate by pressing `e`.
-- `data/` and `gesture_model.pkl` — recordings of you, and a model fitted to
-  your camera, lighting, and personal swipe style. It would generalize poorly
-  to anyone else. **Clone this repo and record your own.**
-
-## Roadmap
-
-- [ ] Publish commands to ROS 2 `/cmd_vel` (`geometry_msgs/Twist`) to drive the
-      simulated Go2 in `go2-social-nav`
-- [ ] Decide command semantics: discrete nudge per gesture vs. continuous
-      velocity with timeout
-- [ ] `twist_mux` so gesture control and keyboard teleop can coexist safely
-- [ ] Background-threaded face detection
-- [ ] Unit tests for the pure functions in `gesture_common.py`
-- [ ] Configurable gesture set / bindings
+The gesture node **never** publishes to `/cmd_vel`. It publishes `GestureIntent`;
+the IT2-FLS owns all motion.
