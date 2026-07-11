@@ -337,7 +337,6 @@ def run(dispatch=print_dispatch, camera_index=0):
     last_frame_t = time.time()
 
     print("Press 'q' to quit.\n")
-
     def disarm(reason):
         nonlocal armed
         armed = False
