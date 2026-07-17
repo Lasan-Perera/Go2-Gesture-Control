@@ -25,3 +25,5 @@ dist/
 .idea/
 *.swp
 .DS_Store
+data_old_vocab/
+gesture_model_old.pkl

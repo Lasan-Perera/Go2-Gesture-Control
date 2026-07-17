@@ -33,7 +33,7 @@ from collections import Counter
 import numpy as np
 import joblib
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -61,14 +61,22 @@ from gesture_common import (
     COL_SIZE,
     class_to_slug,
     extract_features,
+    subject_from_filename,
 )
 
-# Mirroring a window flips it left<->right, so swipe labels must swap too.
-# Every other class is mirror-symmetric (a fist is a fist either way).
-MIRROR_LABEL = {
-    "TURN LEFT": "TURN RIGHT",
-    "TURN RIGHT": "TURN LEFT",
-}
+# Mirroring a window flips it left<->right, so any label whose meaning depends
+# on direction must swap. The old TURN LEFT/TURN RIGHT pair needed that.
+#
+# The current vocabulary has NO direction-dependent labels:
+#   - COME / BACK OFF are depth motions (toward/away), unchanged by mirroring
+#   - STOP / STAY / ATTENTION are orientation or vertical, unchanged
+#   - RELEASE is a symmetric lateral wave
+#   - FOLLOW deliberately merges source classes 26 (thumb-left) and 27
+#     (thumb-right), so its mirror is still FOLLOW
+#
+# So the map is empty, and mirroring is pure free augmentation: every class
+# mirrors to itself.
+MIRROR_LABEL = {}
 
 
 # --------------------------------------------------------------------------
@@ -134,8 +142,14 @@ def to_features(windows, labels):
 # --------------------------------------------------------------------------
 
 def load_windows():
-    """Load every saved window as a raw array (features come later, post-split)."""
-    windows, labels, skipped = [], [], 0
+    """
+    Load every saved window, plus the SUBJECT each one came from.
+
+    The subject is what makes the evaluation honest. Windows are grouped by the
+    person who performed them so that a person never appears in both train and
+    test - see gesture_common.subject_from_filename().
+    """
+    windows, labels, groups, skipped = [], [], [], 0
     for label in GESTURE_CLASSES:
         d = os.path.join(DATA_DIR, class_to_slug(label))
         if not os.path.isdir(d):
@@ -149,7 +163,8 @@ def load_windows():
                 continue
             windows.append(w)
             labels.append(label)
-    return windows, np.array(labels), skipped
+            groups.append(subject_from_filename(fname))
+    return windows, np.array(labels), np.array(groups), skipped
 
 
 def make_clf():
@@ -168,7 +183,7 @@ def main():
               f"    python3 collect_gestures.py")
         sys.exit(1)
 
-    windows, y_all, skipped = load_windows()
+    windows, y_all, groups, skipped = load_windows()
     if len(windows) == 0:
         print("No usable samples found. Record some with collect_gestures.py first.")
         sys.exit(1)
@@ -212,9 +227,18 @@ def main():
 
     # ---- Honest held-out evaluation --------------------------------------
     idx = np.arange(len(windows))
-    idx_train, idx_test = train_test_split(
-        idx, test_size=0.25, random_state=42, stratify=y_all
-    )
+
+    # Split BY SUBJECT, not at random. The question that matters is "does this
+    # work on a person it has never seen", and a random split cannot answer it:
+    # the same person would appear on both sides. This is also what makes the
+    # overlapping windows from extract_dataset.py safe.
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42)
+    idx_train, idx_test = next(gss.split(idx, y_all, groups=groups))
+
+    n_train_subj = len(set(groups[idx_train]))
+    n_test_subj = len(set(groups[idx_test]))
+    print(f"\nSubject-wise split: {n_train_subj} subjects train / "
+          f"{n_test_subj} subjects test (no person appears in both)")
 
     train_w = [windows[i] for i in idx_train]
     train_y = y_all[idx_train]
@@ -253,12 +277,12 @@ def main():
     # accuracy is close to worthless: a model that always answers NONE scores
     # whatever fraction of the data is NONE. Macro F1 weights every class
     # equally, so a model that ignores your swipes cannot hide behind NONE.
-    n_splits = min(5, min(counts.values()))
+    n_splits = min(5, len(set(groups)), min(counts.values()))
     cv_f1 = None
     if n_splits >= 2:
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
         fold_f1, fold_acc = [], []
-        for tr, te in skf.split(idx, y_all):
+        for tr, te in skf.split(idx, y_all, groups=groups):
             fw = [windows[i] for i in tr]
             fy = y_all[tr]
             if AUGMENT:
@@ -274,7 +298,7 @@ def main():
         cv_f1 = fold_f1.mean()
 
         baseline = max(counts.values()) / sum(counts.values())
-        print(f"\n{n_splits}-fold cross-validation:")
+        print(f"\n{n_splits}-fold cross-validation (grouped by subject):")
         print(f"  macro F1  : {cv_f1:.3f} +/- {fold_f1.std():.3f}   <- the number that matters")
         print(f"  accuracy  : {fold_acc.mean():.3f} +/- {fold_acc.std():.3f}")
         print(f"  (a model that ALWAYS answers '{max(counts, key=counts.get)}' "

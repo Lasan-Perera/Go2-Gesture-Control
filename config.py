@@ -130,6 +130,59 @@ CONTINUOUS_STRIDE = WINDOW_FRAMES
 
 
 # --------------------------------------------------------------------------
+# Dataset extraction (extract_dataset.py)
+# --------------------------------------------------------------------------
+
+# Stride between windows cut from a dataset clip. DELIBERATELY smaller than
+# WINDOW_FRAMES - i.e. overlapping windows - which is normally the leakage bug
+# described above.
+#
+# It is safe HERE, and only here, because the dataset has 21 named subjects and
+# train_gestures.py splits BY SUBJECT (GroupKFold). Every window cut from one
+# person's clip carries that person's id, so all of them land on the same side
+# of the split. A near-duplicate cannot leak across a boundary it can't cross.
+#
+# This matters most for STOP: the source gesture (fist -> open palm) averages
+# only ~16 frames, so a non-overlapping stride yields barely one window per
+# clip and starves the single most safety-critical class.
+EXTRACT_STRIDE = 4
+
+# Temporal augmentation: sample every Nth frame to synthesise the same gesture
+# performed at different speeds.
+#
+# The source videos are 30 fps. The live pipeline runs ~16-20 fps once pose
+# estimation is alongside hand tracking. A 12-frame window therefore spans
+# ~0.4 s in the dataset but ~0.6-0.75 s live, so an identical gesture presents
+# with different per-frame displacement. Feeding the model both stride-1 and
+# stride-2 versions teaches it the gesture SHAPE rather than one frame rate's
+# idea of its speed.
+#
+# Stride 2 needs 24 source frames for a 12-frame window, so it simply doesn't
+# fire on the shortest clips - that's expected, not an error.
+TEMPORAL_STRIDES = (1, 2)
+
+# Frames to add either side of the annotated gesture segment.
+#
+# The annotation marks the gesture proper, but STOP (fist -> open palm) is only
+# ~16 frames, barely longer than one window. The frames immediately either side
+# are not noise: they are the hand already in fist, or already open, which is
+# exactly the state the open/closed flags encode. A small pad recovers usable
+# windows for the short classes without dragging in the long drift into and out
+# of position.
+TIMING_PAD = 4
+
+# Ceiling on windows taken from a single clip.
+#
+# Overlapping windows scale with clip length, so without a cap the long classes
+# run away: ATTENTION (~86 frames) would yield ~35 windows per clip while STOP
+# (~16 frames) yields 2 - a 17x imbalance that is an artefact of gesture
+# duration, not of how much there is to learn. Sampling evenly across the clip
+# up to this many windows keeps every class in the same order of magnitude, and
+# class_weight="balanced" mops up the rest.
+MAX_WINDOWS_PER_CLIP = 8
+
+
+# --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
 

@@ -14,6 +14,9 @@ runner, they would eventually drift apart and the model would silently
 degrade - this is the classic "train/serve skew" bug.
 """
 
+import os
+import re
+
 import numpy as np
 
 from config import (
@@ -52,12 +55,21 @@ COL_T, COL_CX, COL_CY, COL_SIZE, COL_OPEN, COL_CLOSED = range(6)
 # explicit "nothing is happening" answer, and is where most of your recorded
 # samples should go.
 
+# The six commands + the wake gesture. Sourced from the Zenodo-27 dataset
+# (see extract_dataset.py for the class mapping). Each was chosen so that it
+# differs from the others on a feature this project ACTUALLY measures - palm
+# centre, palm size, open/closed. Palm ORIENTATION is invisible to these
+# features, which is why several "open palm raised" source classes were
+# rejected: they look different to a human and identical to the model.
+
 MOVEMENT_CLASSES = [
-    "TURN LEFT",
-    "TURN RIGHT",
-    "MOVE FORWARD",
-    "MOVE BACKWARD",
-    "STOP",
+    "COME",       # 2 fingers + arm toward camera  -> size grows, open=0
+    "FOLLOW",     # thumb out + lateral translate  -> high path, high net
+    "STOP",       # fist -> open palm              -> open flag flips
+    "STAY",       # open palm lowers to floor      -> ndy positive
+    "BACK OFF",   # open palm pushed forward       -> size grows, open=1
+    "RELEASE",    # lateral wave                   -> high path, ~0 net
+    "ATTENTION",  # thumbs up (wake gesture)       -> static, low motion
 ]
 NONE_CLASS = "NONE"
 GESTURE_CLASSES = MOVEMENT_CLASSES + [NONE_CLASS]
@@ -69,6 +81,43 @@ def class_to_slug(label):
 
 def slug_to_class(slug):
     return slug.replace("_", " ")
+
+
+# --------------------------------------------------------------------------
+# Subject grouping
+# --------------------------------------------------------------------------
+# Sample files are named so the SUBJECT who performed the gesture can be
+# recovered from the filename alone:
+#
+#     z27_u07_c22_r1_00042.npy   -> subject "z27_u07"   (Zenodo-27, user 7)
+#     ipn_u013_00007.npy         -> subject "ipn_u013"  (IPN-Hand, subject 13)
+#     sample_0003.npy            -> subject "sample_0003" (own group)
+#
+# train_gestures.py splits BY SUBJECT, not at random, for two reasons:
+#
+#   1. It answers the question that actually matters: does this work on a
+#      person the model has never seen? A random split lets the SAME person
+#      appear in train and test, which flatters the score and tells you
+#      nothing about a new operator walking up to the robot.
+#
+#   2. It makes overlapping windows safe. Near-duplicate windows cut from one
+#      clip all carry that clip's subject id, so they cannot straddle the
+#      split - which is what lets extract_dataset.py use EXTRACT_STRIDE < a
+#      full window and rescue the short classes.
+#
+# A file with no parseable subject becomes its own group: it can never leak
+# against anything else, which is the safe default.
+
+_SUBJECT_RE = re.compile(r"^([a-zA-Z0-9]+_u\d+)")
+
+
+def subject_from_filename(fname):
+    """Recover the subject id from a sample filename. Falls back to the stem."""
+    base = os.path.basename(fname)
+    m = _SUBJECT_RE.match(base)
+    if m:
+        return m.group(1)
+    return os.path.splitext(base)[0]
 
 
 # --------------------------------------------------------------------------
