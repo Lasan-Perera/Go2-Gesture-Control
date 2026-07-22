@@ -31,9 +31,9 @@ from config import (
 # Sample format
 # --------------------------------------------------------------------------
 # A "sample" is a window of consecutive frames, stored as an array of shape
-# (WINDOW_FRAMES, 6). Each row is one frame:
+# (WINDOW_FRAMES, 8). Each row is one frame:
 #
-#     [ t, cx, cy, size, open, closed ]
+#     [ t, cx, cy, size, open, closed, nfing, thumb ]
 #
 #   t      : timestamp (seconds). Recorded for future use; NOT used as a
 #            feature, because tying features to frame timing would make the
@@ -43,8 +43,39 @@ from config import (
 #            the hand moves closer to the camera.
 #   open   : 1.0 if the hand is open (fingers extended), else 0.0
 #   closed : 1.0 if the hand is a fist (fingers curled), else 0.0
+#   nfing  : how many of the 4 fingers are extended (0..4)
+#   thumb  : 1.0 if the thumb is extended away from the palm, else 0.0
+#
+# Why nfing and thumb exist
+# -------------------------
+# The first six columns describe MOTION and nothing else. That is enough to
+# separate gestures that move differently (COME scored 0.95, STAY 0.90), and
+# useless for gestures that differ only in HAND SHAPE.
+#
+# It cost us STOP. STOP (fist -> open palm) and BACK OFF (open palm pushed
+# forward) are both "open hand moving toward the camera" in motion space, and
+# the model confused them in both directions - STOP scored 0.59, the worst in
+# the vocabulary and the one gesture that must never fail.
+#
+# The open/closed flags were already there, but they are BINARY and each needs
+# 3 of 4 fingers to agree, so a hand mid-open registers as neither. A graded
+# count exposes the whole opening trajectory:
+#
+#     STOP     : nfing goes 0 -> 4          (delta +4)
+#     BACK OFF : nfing stays 4              (delta  0)
+#     COME     : nfing stays 2              (two fingers throughout)
+#
+# Nothing else in the vocabulary changes finger count, so the delta alone
+# separates STOP. `thumb` is tracked separately because the thumb abducts
+# sideways rather than curling, so the tip/pip test used for the other four
+# does not apply to it - and because FOLLOW is defined by an extended thumb.
 
-COL_T, COL_CX, COL_CY, COL_SIZE, COL_OPEN, COL_CLOSED = range(6)
+COL_T, COL_CX, COL_CY, COL_SIZE, COL_OPEN, COL_CLOSED, COL_NFING, COL_THUMB = range(8)
+
+# Columns in one stored frame row. Bumped 6 -> 8 when finger shape was added.
+# load_windows() checks this and skips older samples, so mixing old and new
+# recordings cannot silently corrupt training.
+ROW_WIDTH = 8
 
 # --------------------------------------------------------------------------
 # Gesture classes
@@ -69,7 +100,6 @@ MOVEMENT_CLASSES = [
     "STAY",       # open palm lowers to floor      -> ndy positive
     "BACK OFF",   # open palm pushed forward       -> size grows, open=1
     "RELEASE",    # lateral wave                   -> high path, ~0 net
-    "ATTENTION",  # thumbs up (wake gesture)       -> static, low motion
 ]
 NONE_CLASS = "NONE"
 GESTURE_CLASSES = MOVEMENT_CLASSES + [NONE_CLASS]
@@ -125,6 +155,8 @@ def subject_from_filename(fname):
 # --------------------------------------------------------------------------
 
 WRIST = 0
+THUMB_MCP = 2
+THUMB_TIP = 4
 INDEX_MCP = 5
 MIDDLE_MCP = 9
 MIDDLE_TIP = 12
@@ -142,6 +174,14 @@ _FINGER_TIP_PIP_PAIRS = [
     (RING_TIP, RING_PIP),
     (PINKY_TIP, PINKY_PIP),
 ]
+
+# Thumb tip -> index knuckle distance, in palm-size units, above which the
+# thumb counts as extended. Tucked across the palm that ratio sits near 0.4;
+# swung clear it passes 1.0. 0.65 is the gap between those two regimes.
+#
+# This is a structural fact about hand geometry, not a behaviour to tune, so it
+# lives here rather than in config.py.
+THUMB_EXTENDED_RATIO = 0.65
 
 
 def palm_center(landmarks):
@@ -173,8 +213,44 @@ def is_hand_closed(landmarks):
     return curled >= 3
 
 
+def count_extended_fingers(landmarks):
+    """
+    How many of the four fingers are extended (0..4).
+
+    Same tip-above-pip test the open/closed flags use, but GRADED rather than
+    thresholded. The binary flags need 3 of 4 to agree, so a half-open hand
+    registers as neither open nor closed and the transition is invisible. The
+    count exposes it, which is what separates STOP (0 -> 4) from BACK OFF
+    (4 -> 4).
+    """
+    return sum(1 for tip, pip in _FINGER_TIP_PIP_PAIRS
+               if landmarks[tip].y < landmarks[pip].y)
+
+
+def is_thumb_extended(landmarks):
+    """
+    Is the thumb held away from the palm?
+
+    The thumb needs its own test: it abducts sideways rather than curling
+    toward the wrist, so the tip-above-pip comparison used for the other four
+    fingers does not apply to it.
+
+    Instead we measure how far the thumb tip sits from the index knuckle, in
+    units of palm size. Tucked across the palm the tip lands close to that
+    knuckle; extended, it swings well clear. Dividing by palm size keeps the
+    test independent of how near the hand is to the camera, the same trick the
+    motion features use.
+    """
+    ps = palm_size(landmarks)
+    if ps <= 1e-6:
+        return False
+    tx, ty = landmarks[THUMB_TIP].x, landmarks[THUMB_TIP].y
+    ix, iy = landmarks[INDEX_MCP].x, landmarks[INDEX_MCP].y
+    return (np.hypot(tx - ix, ty - iy) / ps) > THUMB_EXTENDED_RATIO
+
+
 def frame_row(t, landmarks):
-    """Build one (t, cx, cy, size, open, closed) row from raw hand landmarks."""
+    """Build one (t, cx, cy, size, open, closed, nfing, thumb) row."""
     cx, cy = palm_center(landmarks)
     return (
         float(t),
@@ -183,6 +259,8 @@ def frame_row(t, landmarks):
         palm_size(landmarks),
         1.0 if is_hand_open(landmarks) else 0.0,
         1.0 if is_hand_closed(landmarks) else 0.0,
+        float(count_extended_fingers(landmarks)),
+        1.0 if is_thumb_extended(landmarks) else 0.0,
     )
 
 
@@ -191,33 +269,44 @@ def frame_row(t, landmarks):
 # --------------------------------------------------------------------------
 
 # Feature layout (per sample), all derived from the window:
-#   per-frame (5 x WINDOW_FRAMES):
+#   per-frame (7 x WINDOW_FRAMES):
 #       ndx[i]  : horizontal displacement from frame 0, normalized by palm size
 #       ndy[i]  : vertical displacement from frame 0, normalized by palm size
 #       nsz[i]  : palm size relative to frame 0 (1.0 = unchanged, >1 = closer)
 #       open[i] : open flag
 #       cls[i]  : closed flag
-#   aggregate (11):
-#       net dx / dy / size-change, path length, peak step speed, spread of
-#       dx/dy/size, fraction of frames open/closed, and horizontal-vs-vertical
-#       dominance (which separates swipes from incidental vertical drift).
+#       nfg[i]  : extended-finger count, 0..4
+#       thb[i]  : thumb-extended flag
+#   aggregate (17):
+#       MOTION (11): net dx / dy / size-change, path length, peak step speed,
+#           spread of dx/dy/size, fraction of frames open/closed, and
+#           horizontal-vs-vertical dominance (which separates swipes from
+#           incidental vertical drift).
+#       SHAPE (6): first and last finger count, the CHANGE between them, mean
+#           and spread of the count, and fraction of frames with the thumb out.
+#
+# The shape aggregates exist for STOP. `nfg[-1] - nfg[0]` is +4 for STOP (fist
+# opening) and ~0 for BACK OFF (already open), which is the one thing that
+# separates two gestures identical in motion space. Nothing else in the
+# vocabulary changes finger count, so this feature is close to a STOP detector
+# on its own.
 #
 # Why normalize by palm size? Because a swipe performed close to the camera
 # covers far more of the frame than the same swipe performed further away.
 # Dividing by palm size (a proxy for distance) makes the features roughly
 # scale-invariant - something the old fixed pixel-fraction thresholds could
-# never do.
+# never do. Finger count needs no such treatment: it is already a count.
 
-FEATURE_DIM = 5 * WINDOW_FRAMES + 11
+FEATURE_DIM = 7 * WINDOW_FRAMES + 17
 
 
 def extract_features(window):
     """
-    Turn a (WINDOW_FRAMES, 6) window into a 1-D feature vector.
-    Returns None if the window is the wrong length or degenerate.
+    Turn a (WINDOW_FRAMES, ROW_WIDTH) window into a 1-D feature vector.
+    Returns None if the window is the wrong shape or degenerate.
     """
     w = np.asarray(window, dtype=np.float64)
-    if w.ndim != 2 or w.shape[0] != WINDOW_FRAMES or w.shape[1] != 6:
+    if w.ndim != 2 or w.shape[0] != WINDOW_FRAMES or w.shape[1] != ROW_WIDTH:
         return None
 
     cx = w[:, COL_CX]
@@ -225,6 +314,8 @@ def extract_features(window):
     size = w[:, COL_SIZE]
     op = w[:, COL_OPEN]
     cl = w[:, COL_CLOSED]
+    nfg = w[:, COL_NFING]
+    thb = w[:, COL_THUMB]
 
     s0 = float(size[0])
     if not np.isfinite(s0) or s0 <= 1e-6:
@@ -237,10 +328,11 @@ def extract_features(window):
     if not np.all(np.isfinite(ndx)) or not np.all(np.isfinite(ndy)) or not np.all(np.isfinite(nsz)):
         return None
 
-    per_frame = np.concatenate([ndx, ndy, nsz, op, cl])
+    per_frame = np.concatenate([ndx, ndy, nsz, op, cl, nfg, thb])
 
     step = np.hypot(np.diff(ndx), np.diff(ndy))
     agg = np.array([
+        # --- motion ---
         ndx[-1],                                  # net horizontal travel
         ndy[-1],                                  # net vertical travel
         nsz[-1] - 1.0,                            # net size change (push/pull)
@@ -252,6 +344,14 @@ def extract_features(window):
         float(op.mean()),                         # fraction of frames hand was open
         float(cl.mean()),                         # fraction of frames hand was a fist
         abs(ndx[-1]) - abs(ndy[-1]),              # horizontal dominance (swipe signature)
+
+        # --- shape ---
+        float(nfg[0]),                            # fingers at the start
+        float(nfg[-1]),                           # fingers at the end
+        float(nfg[-1] - nfg[0]),                  # THE STOP feature: +4 opening, ~0 already open
+        float(nfg.mean()),                        # typical finger count (COME sits near 2)
+        float(nfg.std()),                         # did the shape change at all?
+        float(thb.mean()),                        # fraction of frames thumb was out (FOLLOW)
     ], dtype=np.float64)
 
     feats = np.concatenate([per_frame, agg])

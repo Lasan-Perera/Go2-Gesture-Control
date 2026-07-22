@@ -35,6 +35,31 @@ CONFIDENCE_THRESHOLD = 0.60
 # before firing. 1 = fire immediately (twitchy). 2-3 = noticeably steadier.
 CONSECUTIVE_AGREE = 2
 
+
+# --------------------------------------------------------------------------
+# STOP safety asymmetry
+# --------------------------------------------------------------------------
+# STOP is not just another class. The two ways of getting it wrong are not
+# equally bad:
+#
+#   missed STOP  - the operator says stop, the robot keeps going, or (worse)
+#                  reads it as BACK OFF and moves. On 15 kg of walking robot
+#                  that is the failure that matters.
+#   false STOP   - the robot halts when nobody asked. Annoying. Harmless.
+#
+# So STOP gets a lower bar than every other command: whenever the classifier
+# gives STOP at least this much probability, STOP is emitted even if another
+# label scored higher. Everything else still has to clear CONFIDENCE_THRESHOLD.
+#
+# This is deliberately NOT symmetric and NOT a tie-break - it is an override.
+#
+# Tune it from data, not by feel: train_gestures.py prints a sweep of this
+# value against the held-out set showing exactly how many missed STOPs each
+# threshold recovers and how many false STOPs it costs. Lower = safer and
+# twitchier. Set to 1.01 to disable the override entirely.
+STOP_CLASS = "STOP"
+STOP_CONFIDENCE_THRESHOLD = 0.35
+
 DISPLAY_HOLD_SECONDS = 0.9   # how long a detected command stays on screen
 NO_HAND_RESET_FRAMES = 8     # clear the motion buffer after this many hand-less frames
 
@@ -44,10 +69,31 @@ SHOW_FPS = True              # draw a frame-rate / latency readout
 # --------------------------------------------------------------------------
 # Arm / disarm (wake gesture)
 # --------------------------------------------------------------------------
+# These used to test is_hand_open / is_hand_closed, which need only 3 of the 4
+# fingers to agree. That was fine for the old swipe vocabulary, where no real
+# gesture ever held still. It is not fine now:
+#
+#   - a RELAXED hand is a loosely curled hand held still, so simply pausing
+#     disarmed the system
+#   - STOP begins as a fist, so starting a STOP disarmed the system
+#   - STAY and BACK OFF are open palms, so slowing down mid-gesture armed it
+#
+# The finger count fixes this. A deliberate fist has ALL four fingers curled
+# and the thumb wrapped in; a relaxed hand almost never does. A deliberate open
+# palm has all four extended. Requiring the extremes leaves the ambiguous
+# middle - which is where resting hands and gesture transitions live - doing
+# nothing at all.
 
-ARM_HOLD_FRAMES = 15         # frames of held open palm (inside the zone) to ARM
-DISARM_HOLD_FRAMES = 15      # frames of held closed fist (inside the zone) to DISARM
+ARM_HOLD_FRAMES = 20         # frames of held FULL open palm (all 4 fingers) to ARM
+DISARM_HOLD_FRAMES = 40      # frames of held TIGHT fist (0 fingers, thumb in) to DISARM
 ARMED_TIMEOUT_SECONDS = 20   # auto-disarm if no command fires for this long
+
+# Frames to ignore arm/disarm for after either one fires.
+#
+# Without this, STOP (fist -> open palm) can disarm on its opening frames and
+# re-arm on its closing frames, all inside one gesture. The cooldown makes each
+# state change cost a deliberate pause, which is what a mode switch should cost.
+ARM_DISARM_COOLDOWN_FRAMES = 30
 
 # SAFETY: disarm once the enrolled operator's face has been gone for a while.
 #
@@ -180,6 +226,41 @@ TIMING_PAD = 4
 # up to this many windows keeps every class in the same order of magnitude, and
 # class_weight="balanced" mops up the rest.
 MAX_WINDOWS_PER_CLIP = 8
+
+
+# --------------------------------------------------------------------------
+# IPN-Hand NONE extraction (extract_ipn_none.py)
+# --------------------------------------------------------------------------
+
+# Only the D0X (non-gesture) segments become NONE.
+#
+# NOT B0A/B0B ("pointing with one/two fingers"): B0B is two fingers moving
+# around, and COME is two fingers moved toward the camera. Labelling B0B as
+# NONE would hand the model contradictory labels for near-identical motion and
+# degrade both classes - the same trap as recording STOP during a NONE session.
+# The G0x classes are worse still (G05/G06 throw left/right resemble RELEASE;
+# G10/G11 zoom in/out resemble COME/BACK OFF).
+IPN_NONE_LABEL = "D0X"
+
+# Windows per D0X segment. Deliberately far below MAX_WINDOWS_PER_CLIP.
+#
+# There are 1431 D0X segments averaging 147 frames. At 8 windows each that is
+# ~11,000 NONE windows against a largest command class of 986 - NONE would stop
+# being a class and start being the answer. At 2 each it lands near 2,800,
+# roughly 3x the biggest command class, which is the ratio that suppresses
+# false positives without swamping training.
+#
+# Two windows from 1431 different segments also beats eight from fewer: NONE
+# needs BREADTH ("all the ways nothing is happening"), not depth.
+IPN_MAX_WINDOWS_PER_SEGMENT = 2
+
+# Frames sampled from the middle of each D0X segment.
+#
+# We only need enough to build the capped number of windows, so there is no
+# reason to run the landmarker over an entire 147-frame segment and throw 90%
+# of it away. Sampling the middle avoids the edges, where the hand is still
+# arriving from (or leaving toward) the neighbouring real gesture.
+IPN_FRAMES_PER_SEGMENT = 40
 
 
 # --------------------------------------------------------------------------

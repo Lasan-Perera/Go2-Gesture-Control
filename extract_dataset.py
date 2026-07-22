@@ -163,7 +163,7 @@ def rows_from_video(tracker, path, start_f, end_f):
     return segments
 
 
-def windows_from_segments(segments):
+def windows_from_segments(segments, max_windows=MAX_WINDOWS_PER_CLIP):
     """
     Slice each segment into WINDOW_FRAMES windows.
 
@@ -179,6 +179,10 @@ def windows_from_segments(segments):
     and the live pipeline is ~16-20 fps, so this is what stops the model from
     learning one frame rate's notion of speed. Stride 2 needs twice the frames,
     so it silently doesn't fire on short clips.
+
+    `max_windows` is a parameter rather than a constant because IPN's NONE
+    segments need a much tighter cap than the gesture clips - see
+    IPN_MAX_WINDOWS_PER_SEGMENT in config.py.
     """
     out = []
     for seg in segments:
@@ -193,8 +197,8 @@ def windows_from_segments(segments):
 
     # Cap per clip, sampling EVENLY across it rather than truncating. Truncating
     # would keep only the start of every gesture and throw the ending away.
-    if len(out) > MAX_WINDOWS_PER_CLIP:
-        keep = np.linspace(0, len(out) - 1, MAX_WINDOWS_PER_CLIP).astype(int)
+    if len(out) > max_windows:
+        keep = np.linspace(0, len(out) - 1, max_windows).astype(int)
         out = [out[i] for i in sorted(set(keep))]
     return out
 

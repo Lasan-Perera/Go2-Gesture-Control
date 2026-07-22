@@ -110,6 +110,8 @@ import config
 from gesture_common import (
     COL_OPEN,
     COL_CLOSED,
+    COL_NFING,
+    COL_THUMB,
     palm_center,
     frame_row,
     held_still,
@@ -325,6 +327,10 @@ def run(dispatch=print_dispatch, camera_index=0):
     armed = False
     armed_since = 0.0
 
+    # Frames remaining before arm/disarm may fire again. Stops a single gesture
+    # from toggling the mode twice as it passes through fist and open poses.
+    mode_cooldown = 0
+
     frame_idx = 0
     last_face_box = None
     # Timestamp of the last SUCCESSFUL face match. Using a timestamp rather
@@ -337,6 +343,7 @@ def run(dispatch=print_dispatch, camera_index=0):
     last_frame_t = time.time()
 
     print("Press 'q' to quit.\n")
+
     def disarm(reason):
         nonlocal armed
         armed = False
@@ -395,6 +402,12 @@ def run(dispatch=print_dispatch, camera_index=0):
         zone = (zone_from_face_box(last_face_box, w, h)
                 if (target_visible and last_face_box) else None)
 
+        # Tick the arm/disarm cooldown. Decremented here, once per processed
+        # frame, rather than inside the landmark branch - a cooldown measured in
+        # frames must not stall just because the hand briefly left the picture.
+        if mode_cooldown > 0:
+            mode_cooldown -= 1
+
         # --- SAFETY: never stay armed once the operator has really gone ---
         # Deliberately a much longer grace than the zone one above: a hand
         # sweeping across your face is not you walking away, and disarming on
@@ -433,16 +446,30 @@ def run(dispatch=print_dispatch, camera_index=0):
             if now >= display_until:
                 if not armed:
                     # Idle: the only thing we look for is the arm (wake) gesture.
-                    if held_still(buffer, config.ARM_HOLD_FRAMES, lambda p: p[COL_OPEN] > 0.5):
+                    # A FULL open palm - all four fingers extended - not merely
+                    # "open-ish", so a hand drifting through a half-open pose on
+                    # its way somewhere else does not arm the system.
+                    if (mode_cooldown <= 0 and held_still(
+                            buffer, config.ARM_HOLD_FRAMES,
+                            lambda p: p[COL_NFING] >= 4)):
                         armed = True
                         armed_since = now
+                        mode_cooldown = config.ARM_DISARM_COOLDOWN_FRAMES
                         buffer.clear()
                         pred_history.clear()
                         print("[ARMED] Now listening for movement commands.")
                 else:
                     # Armed: check disarm first, then classify.
-                    if held_still(buffer, config.DISARM_HOLD_FRAMES, lambda p: p[COL_CLOSED] > 0.5):
-                        disarm("closed fist held")
+                    #
+                    # A TIGHT fist: every finger curled AND the thumb wrapped in.
+                    # A resting hand is loosely curled with the thumb loose, and
+                    # no longer disarms. STOP's opening fist is also brief and
+                    # moving, so it fails the held-still test.
+                    if (mode_cooldown <= 0 and held_still(
+                            buffer, config.DISARM_HOLD_FRAMES,
+                            lambda p: p[COL_NFING] <= 0 and p[COL_THUMB] < 0.5)):
+                        disarm("tight fist held")
+                        mode_cooldown = config.ARM_DISARM_COOLDOWN_FRAMES
                     else:
                         if bundle is not None:
                             cmd, conf = predict_gesture(buffer, bundle)

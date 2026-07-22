@@ -43,6 +43,8 @@ from sklearn.metrics import (
 
 from config import (
     WINDOW_FRAMES,
+    STOP_CLASS,
+    STOP_CONFIDENCE_THRESHOLD,
     DATA_DIR,
     MODEL_PATH,
     MIN_SAMPLES_PER_CLASS,
@@ -62,6 +64,7 @@ from gesture_common import (
     class_to_slug,
     extract_features,
     subject_from_filename,
+    ROW_WIDTH,
 )
 
 # Mirroring a window flips it left<->right, so any label whose meaning depends
@@ -158,7 +161,9 @@ def load_windows():
             if not fname.endswith(".npy"):
                 continue
             w = np.load(os.path.join(d, fname))
-            if w.shape != (WINDOW_FRAMES, 6) or extract_features(w) is None:
+            # Samples recorded before finger shape was added are 6 columns wide
+            # and are skipped here rather than silently mixed in.
+            if w.shape != (WINDOW_FRAMES, ROW_WIDTH) or extract_features(w) is None:
                 skipped += 1
                 continue
             windows.append(w)
@@ -175,6 +180,65 @@ def make_clf():
         random_state=42,
         n_jobs=-1,
     )
+
+
+def report_stop_sweep(clf, X_test, y_test):
+    """
+    Show what each STOP_CONFIDENCE_THRESHOLD actually costs and buys.
+
+    STOP gets an override in gesture_model.py: if the classifier gives STOP at
+    least this much probability, STOP is emitted even when another label scored
+    higher. That is a deliberate safety asymmetry, and the right value for it is
+    a judgement about consequences, not accuracy - so this prints the exact
+    trade so the number can be chosen from evidence rather than feel.
+
+    MISSED  = a real STOP that does not come out as STOP. The robot keeps
+              moving, or backs off, when told to halt. The failure that matters.
+    FALSE   = something else that comes out as STOP. The robot halts when it
+              was not asked. Inconvenient, harmless.
+    """
+    if STOP_CLASS not in set(y_test):
+        return
+
+    classes = list(clf.classes_)
+    if STOP_CLASS not in classes:
+        return
+
+    probs = clf.predict_proba(X_test)
+    i_stop = classes.index(STOP_CLASS)
+    is_stop = (y_test == STOP_CLASS)
+    n_stop = int(is_stop.sum())
+
+    print("\n" + "=" * 62)
+    print("STOP SAFETY ASYMMETRY - threshold sweep on the held-out set")
+    print("=" * 62)
+    print(f"{'thresh':>7}{'STOP recall':>13}{'missed':>9}{'false':>8}   note")
+
+    for t in (1.01, 0.60, 0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20):
+        # replay the live rule: STOP wins outright if it clears t
+        pred = []
+        for row in probs:
+            best = int(np.argmax(row))
+            if classes[best] != STOP_CLASS and float(row[i_stop]) >= t:
+                pred.append(STOP_CLASS)
+            else:
+                pred.append(classes[best])
+        pred = np.array(pred)
+
+        caught = int(((pred == STOP_CLASS) & is_stop).sum())
+        missed = n_stop - caught
+        false = int(((pred == STOP_CLASS) & ~is_stop).sum())
+
+        note = ""
+        if t > 1.0:
+            note = "override off (baseline)"
+        print(f"{t:>7.2f}{caught / n_stop:>13.2f}{missed:>9}{false:>8}   {note}")
+
+    print(f"\n({n_stop} real STOP windows in the test set, "
+          f"{len(y_test) - n_stop} non-STOP)")
+    print(f"Currently set: STOP_CONFIDENCE_THRESHOLD = {STOP_CONFIDENCE_THRESHOLD}")
+    print("Pick the row where 'missed' is acceptably low and 'false' is still")
+    print("tolerable, then set that value in config.py.")
 
 
 def main():
@@ -269,7 +333,9 @@ def main():
         row = "".join(f"{v:>10}" for v in cm[i])
         print(f"{label:<15}{row}")
     print("\nRead this: off-diagonal cells are your real problem gestures.")
-    print("If TURN LEFT is being confused with NONE, record more of both.")
+
+    # ---- STOP safety asymmetry: what does each threshold actually buy? ----
+    report_stop_sweep(clf, X_test, y_test)
 
     # ---- Cross-validation, augmenting each training fold only -------------
     #

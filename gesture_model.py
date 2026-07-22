@@ -11,7 +11,13 @@ import os
 
 import numpy as np
 
-from config import MODEL_PATH, CONFIDENCE_THRESHOLD, WINDOW_FRAMES
+from config import (
+    MODEL_PATH,
+    CONFIDENCE_THRESHOLD,
+    WINDOW_FRAMES,
+    STOP_CLASS,
+    STOP_CONFIDENCE_THRESHOLD,
+)
 from gesture_common import (
     FEATURE_DIM,
     NONE_CLASS,
@@ -52,6 +58,8 @@ def predict_gesture(buffer, bundle):
 
     Returns (label, confidence). `label` is None when the model is not
     confident enough, or when it believes nothing is happening (NONE).
+
+    STOP is handled asymmetrically - see apply_stop_override().
     """
     if bundle is None or len(buffer) < WINDOW_FRAMES:
         return None, 0.0
@@ -63,10 +71,52 @@ def predict_gesture(buffer, bundle):
 
     model = bundle["model"]
     probs = model.predict_proba(feats.reshape(1, -1))[0]
-    best = int(np.argmax(probs))
-    label = model.classes_[best]
-    conf = float(probs[best])
+    return decide(probs, list(model.classes_))
 
-    if label == NONE_CLASS or conf < CONFIDENCE_THRESHOLD:
+
+def apply_stop_override(probs, classes):
+    """
+    Emit STOP whenever it has at least STOP_CONFIDENCE_THRESHOLD probability,
+    even if another label scored higher.
+
+    Why an override and not a tie-break: the classifier confuses STOP with
+    BACK OFF in both directions (they are both "open hand moving toward the
+    camera" once the fingers have finished opening), and the two errors are not
+    equally costly. Reading BACK OFF as STOP makes the robot halt when it was
+    asked to retreat - inconvenient. Reading STOP as BACK OFF makes the robot
+    move when it was asked to halt - the failure this whole system exists to
+    avoid.
+
+    Returns (index, label, confidence) of the winning class.
+    """
+    best = int(np.argmax(probs))
+    label = str(classes[best])
+
+    if STOP_CLASS in classes and label != STOP_CLASS:
+        i_stop = classes.index(STOP_CLASS)
+        if float(probs[i_stop]) >= STOP_CONFIDENCE_THRESHOLD:
+            return i_stop, STOP_CLASS, float(probs[i_stop])
+
+    return best, label, float(probs[best])
+
+
+def decide(probs, classes):
+    """
+    Turn class probabilities into a dispatched command, or None.
+
+    Split out from predict_gesture so the exact same decision rule can be
+    replayed over the held-out set in train_gestures.py - if the sweep there
+    used different logic from the live loop, its numbers would be fiction.
+    """
+    _, label, conf = apply_stop_override(probs, classes)
+
+    if label == NONE_CLASS:
         return None, conf
-    return str(label), conf
+
+    # STOP already cleared its own (lower) bar inside the override.
+    if label == STOP_CLASS:
+        return label, conf
+
+    if conf < CONFIDENCE_THRESHOLD:
+        return None, conf
+    return label, conf
