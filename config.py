@@ -58,12 +58,33 @@ CONSECUTIVE_AGREE = 2
 # threshold recovers and how many false STOPs it costs. Lower = safer and
 # twitchier. Set to 1.01 to disable the override entirely.
 STOP_CLASS = "STOP"
-STOP_CONFIDENCE_THRESHOLD = 0.35
+STOP_CONFIDENCE_THRESHOLD = 0.20
 
 DISPLAY_HOLD_SECONDS = 0.9   # how long a detected command stays on screen
 NO_HAND_RESET_FRAMES = 8     # clear the motion buffer after this many hand-less frames
 
 SHOW_FPS = True              # draw a frame-rate / latency readout
+
+
+# --------------------------------------------------------------------------
+# Capture resolution
+# --------------------------------------------------------------------------
+# Both MediaPipe models cost roughly in proportion to pixel count, and hand
+# landmarking is the more expensive of the two (~43 ms vs ~33 ms at the same
+# size). A webcam left on its default 1280x720 is therefore paying about three
+# times what 640x480 costs, for detail that a 21-point hand skeleton at 1-2 m
+# does not use.
+#
+# The trade is RANGE, not precision. A hand 3 m away is only a few dozen pixels
+# wide at 640x480, and below some size MediaPipe stops finding it at all. So:
+#
+#   640x480   good for desk testing and close interaction; fastest
+#   1280x720  needed if gestures must be recognised at 3 m
+#
+# This matters more, not less, on the Jetson. Set to None to leave the camera
+# at whatever it defaults to.
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 
 
 # --------------------------------------------------------------------------
@@ -95,55 +116,71 @@ ARMED_TIMEOUT_SECONDS = 20   # auto-disarm if no command fires for this long
 # state change cost a deliberate pause, which is what a mode switch should cost.
 ARM_DISARM_COOLDOWN_FRAMES = 30
 
-# SAFETY: disarm once the enrolled operator's face has been gone for a while.
-#
-# Without this, walking out of shot while ARMED leaves the system armed. You
-# return some time later and the very first hand movement you make - reaching
-# for the keyboard, scratching your nose - is dispatched as a command. Harmless
-# when the output is a print(); not harmless when the output is a robot.
-#
-# Re-arming should always be a deliberate act.
-DISARM_ON_FACE_LOST = True
-
-# How long the face must be CONTINUOUSLY missing before we disarm.
-#
-# This is deliberately much longer than FACE_ZONE_GRACE_SECONDS below. They
-# answer different questions:
-#
-#   "keep using the last known control zone?"  -> your face has not teleported,
-#                                                 a short grace is plenty
-#   "has the operator actually left?"          -> needs a long grace; raising
-#                                                 your hand in front of your own
-#                                                 face while gesturing is normal,
-#                                                 and must not disarm you
-#
-# Set generously. Occlusion by your own hand, turning your head, or a person
-# walking past should all ride through this untouched.
-DISARM_GRACE_SECONDS = 5.0
+# The old DISARM_ON_FACE_LOST / DISARM_GRACE_SECONDS pair lived here. Their job
+# - never stay armed once the operator has actually left - is now done by
+# OPERATOR_LOST_SECONDS below, against the operator's POSE rather than their
+# face. Same safety property, and it survives the operator turning their back,
+# which the face never did.
 
 
 # --------------------------------------------------------------------------
-# Face identity lock
+# Operator lock (pose-based)
 # --------------------------------------------------------------------------
-
-ENROLLED_FACE_PATH = "target_face.npy"
-
-FACE_MATCH_THRESHOLD = 0.55     # lower = stricter (face_recognition "distance")
-FACE_DOWNSCALE = 0.35           # shrink the frame before face detection, for speed
-FACE_DETECT_EVERY_N_FRAMES = 2  # run face ID every Nth frame; reuse the zone between
-
-# How long to keep using the last known control zone after losing the face.
+# Replaces the face-recognition identity lock, which is preserved on the
+# `face-identity-lock` branch. That design answered "where is the operator's
+# face" and drew a control zone around it - but a zone knows WHERE to look, not
+# WHOSE hand it is looking at, so a bystander reaching into it was obeyed.
 #
-# Time-based, not frame-count-based, on purpose. A frame count silently means
-# something different at 30 fps than at 10 fps - and this pipeline's frame rate
-# swings with dlib's mood. Seconds mean seconds.
-FACE_ZONE_GRACE_SECONDS = 1.5
+# It also could not survive this robot: during FOLLOW the camera sees the
+# operator's back, the head-mounted D435i sits ~50 cm up and mostly sees chins,
+# and dlib's HOG detector was the pipeline's largest CPU cost - and has no
+# aarch64 path onto the Jetson. Dropping it also removes stored facial
+# biometrics from the human-participant study, which materially simplifies
+# ethics approval.
 
-# Control zone, as multiples of the detected face box. This is what follows
-# you around the frame.
-ZONE_SIDE_MARGIN = 2.2   # left/right extent, in face widths
-ZONE_ABOVE_MARGIN = 0.3  # extent above the face, in face heights
-ZONE_BELOW_MARGIN = 4.5  # extent below the face (down to roughly waist/hands)
+# How close a hand must be to one of the operator's wrists to count as theirs,
+# as a fraction of frame width.
+#
+# THIS is the constant that enforces exclusivity, and the one to tune during the
+# bystander test:
+#   too tight -> your own hand is dropped when you extend your arm
+#   too loose -> a bystander standing close enough has their hand claimed
+HAND_WRIST_MAX_DIST = 0.25
+
+# How far the operator's shoulder midpoint may move between frames and still be
+# recognised as the same person. People do not teleport; a jump larger than this
+# means we are looking at somebody else.
+OPERATOR_MATCH_MAX_DIST = 0.25
+
+# How long the operator's pose may be missing before the lock is released.
+#
+# The pose equivalent of the old DISARM_ON_FACE_LOST, and the reason that
+# setting existed: leaving the system armed after the operator walks away means
+# the next person's first idle hand movement is dispatched as a command.
+# Harmless when the output is a print(); not harmless when it is a robot.
+OPERATOR_LOST_SECONDS = 2.0
+
+# Run pose estimation only every Nth frame, reusing the last known wrists in
+# between.
+#
+# Pose is the expensive half of the pipeline: hands alone runs ~22-25 fps and
+# pose alone ~29, but both on every frame lands around 9-10, which is below
+# what the 12-frame gesture window needs to feel responsive.
+#
+# Skipping frames is nearly free in accuracy, because pose is used for exactly
+# one thing here - deciding WHICH hand belongs to the operator - and a wrist
+# does not move far in 60 ms. Hand landmarking still runs on every frame, since
+# that is what the gesture features are actually made of.
+#
+# This is the same trick the old face lock used (FACE_DETECT_EVERY_N_FRAMES),
+# and it carries the same trap: any timer or counter gated on "we could not see
+# the operator" must only be updated on frames where the detector ACTUALLY RAN.
+# Counting a skipped frame as evidence of absence is how the previous version
+# managed to disarm people who were standing still in plain view.
+#
+# 2 is a good default. 3 buys a little more speed at some cost in how quickly a
+# lost operator is noticed.
+POSE_EVERY_N_FRAMES = 2
 
 
 # --------------------------------------------------------------------------

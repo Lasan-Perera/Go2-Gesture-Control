@@ -32,15 +32,15 @@ numpy<2
 mediapipe>=0.10.14
 protobuf>=4.25.3,<5
 
-# --- Face recognition (identity lock) ---
-face_recognition
-face_recognition_models @ git+https://github.com/ageitgey/face_recognition_models
-
-# Pinned: face_recognition_models still imports the deprecated pkg_resources
-# module, which setuptools >= 82.0.0 (Feb 2026) removed entirely. Without
-# this pin you'll hit "ModuleNotFoundError: No module named 'pkg_resources'"
-# even though face_recognition_models shows as installed.
-setuptools<82
+# --- Face recognition: REMOVED ---
+# face_recognition / dlib / setuptools<82 used to live here for the face-based
+# operator lock. That lock is now pose-based (see gesture_control.py), so the
+# whole dlib dependency is gone - along with its from-source compile, its
+# pkg_resources/setuptools pin, its CPU cost as the pipeline's slowest step,
+# and the problem of having no aarch64 build path onto the Jetson.
+#
+# The old implementation is preserved on the `face-identity-lock` branch, which
+# still needs those packages if you check it out.
 
 # --- Gesture classifier (training + inference) ---
 # RandomForest over engineered motion features. Chosen over an LSTM because
